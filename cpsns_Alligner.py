@@ -27,6 +27,8 @@ CONFIG_FILE_DEFAULT = "config.json"
 myDict = {}
 bReadingMyDict = False
 bWritingMyDict = False
+bReadingReadBuffer = False
+bWritingReadBuffer = False
 
 json_config = {}
 
@@ -47,6 +49,8 @@ def on_subscribe(self, mqttc, userdata, msg, granted_qos):
 
 def on_message(client, userdata, msg):
     global myDict, bReadingMyDict, bWritingMyDict
+    global readBuffer, timeAxis, bReadingReadBuffer, bWritingReadBuffer
+
     topic = msg.topic
     substrings = topic.split('/')
     bIsMetadata = True
@@ -82,14 +86,23 @@ def on_message(client, userdata, msg):
             secAtAcqusitionStart = 0
             nsecAtAcqusitionStart = 0
 
+            # Check the consistency of the Fs
+            bIgnoreTopic = False
+            if timeAxis["Fs"] == 0:
+                timeAxis["Fs"] = Fs # the first wins
+            else if timeAxis["Fs"] != Fs:
+                print(f"Weird: Fs of topic {topic} is {Fs} Sa/s is different to the common Fs = {timeAxis["Fs"] } Sa/s! The topic is ignored!", file=sys.stderr)
+                bIgnoreTopic = True
+
             # Find the column where to write the data
             try:
                 colInx = json_config["MQTT"]["TopicsToSubscribe"].index(topic)
             except ValueError:
                 colInx = -1
                 print(f"Weird: topic {topic} is not in the list of the TopicsToSubscribe in the config file! Ignored!", file=sys.stderr)
+                bIgnoreTopic = True
             
-            if colInx != -1:
+            if not bIgnoreTopic:
                 #                0         1      2   3       4     5     6     7                     8                      9
                 myDict[myKey] = [nSamples, cType, Fs, colInx, None, None, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
     else:
@@ -113,31 +126,59 @@ def on_message(client, userdata, msg):
             nanosec = struct.unpack_from('Q', payload, 12)[0]
 
             if myDict[myKey][7] == 0:
-                # initialize the beginning of the time axis
+                # initialize the beginning of the topic-specific time axis
                 myDict[myKey][7] = secFromEpoch
                 myDict[myKey][8] = nanosec
-                """ Will be using a global 2D array
-                # allocate the array 
-                if cType=='d':
-                    myDict[myKey][5] = np.full(nSamples, np.nan, dtype=np.float64)
-                else:
-                    myDict[myKey][5] = np.full(nSamples, np.nan, dtype=np.float32)
-                """
+
+            # Same for the global time axis
+            if timeAxis[OriginSecFromEpoch] == 0:
+                timeAxis["OriginSecFromEpoch"] = secFromEpoch
+                timeAxis["Nanosec"] = nanosec
+                # TODO: Here is the nice spot to allocate the readBuffer, as we possess more information than before 
 
             # Compute the index where to copy the data
             print(f"{nSamples} samples at {secFromEpoch}:{nanosec} s.")
 
             # Compute the interval between the current timestamp and the timestamp at the start
-            delta_sec = secFromEpoch - myDict[myKey][7]
-            delta_nsec = nanosec - myDict[myKey][8]
+            delta_sec = secFromEpoch - timeAxis["OriginSecFromEpoch"]
+            delta_nsec = nanosec - timeAxis["Nanosec"]
             if delta_nsec < 0:
                 delta_nsec += 1000000000
                 delta_sec -= 1
             # convert to microsec
             delta_mjus = delta_sec * 1000000.0 + delta_nsec / 1000.0
+            # finally, the inx
             rowInx = round(delta_mjus * (myDict[myKey][2] / 1000000.0))
             print(f"delta = {delta_mjus} mjus. inx = {rowInx}")
-            
+
+            # waiting the buffer to be available
+            while bReadingReadBuffer:                
+                # print("Waiting for bReadingReadBuffer")
+                time.sleep(0.01)  # make the thread sleep
+
+            # check and write...
+            bWritingReadBuffer = True
+            bGoWrite = True
+            if rowInx < 0:
+                # a valid scenario: this is a delayed data chunk
+                # TODO: we can consider reallocating everything to include this datachunk, if it is not superdelayed
+                # for now, we just ignore it
+                print(f"The dealyed from topic {msg.topic} is ignored!", file=sys.stderr)
+                bGoWrite = False
+            else if rowInx >= readBuffer.shape[0]:
+                # readBuffer overrun scenario
+                print(f"readBuffer overrun (1)!", file=sys.stderr)
+                bGoWrite = False
+            else if rowInx+nSamples >= readBuffer.shape[0]::
+                # readBuffer overrun scenario
+                print(f"readBuffer overrun (2)!", file=sys.stderr)
+                bGoWrite = False
+            else:
+                # everything seems okay
+                bGoWrite = True
+                readBuffer[rowInx:rowInx+nSamples, myDict[myKey][3]] = data
+
+            bWritingReadBuffer = False
         else:
             print("Waiting for the metadata...")
     
@@ -147,7 +188,7 @@ def on_message(client, userdata, msg):
 def main():
     global myDict, bReadingMyDict, bWritingMyDict
     global json_config
-    global readBuffer, timeAxis
+    global readBuffer, timeAxis, bReadingReadBuffer, bWritingReadBuffer
 
     # Parse command line parameters
     # Create the parser
@@ -191,7 +232,11 @@ b. Time axis
     nSamplesToCollect = json_config["Output"]["SamplesToCollect"]
     nChannelsToObserve = len(json_config["MQTT"]["TopicsToSubscribe"])
     print(f"nSamplesToCollect={nSamplesToCollect}, nChannelsToObserve={nChannelsToObserve}")
-    readBuffer = np.full((nSamplesToCollect, nChannelsToObserve), np.nan, dtype=np.float32)
+    # the readbuffer should be bigger than the output buffer
+    # TODO: make a smart guess for how much bigger! Now hardcoded to 2
+    readBuffer = np.full((round(2*nSamplesToCollect), nChannelsToObserve), np.nan, dtype=np.float32)
+    bReadingReadBuffer = False
+    bWritingMyDict = False
     
     # Set username and password
     if json_config["MQTT"]["userId"] != "":
