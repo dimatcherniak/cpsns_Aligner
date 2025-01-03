@@ -12,6 +12,7 @@ b. Time axis
 4. When ready, publishes the JSON string explaining the data
 """
 import numpy as np
+import paho.mqtt.client as mqtt
 from paho.mqtt.client import Client as MQTTClient
 from paho.mqtt.client import CallbackAPIVersion
 from paho.mqtt.client import MQTTv311
@@ -91,14 +92,19 @@ def on_message(client, userdata, msg):
             if timeAxis["Fs"] == 0:
                 timeAxis["Fs"] = Fs # the first wins
             elif timeAxis["Fs"] != Fs:
-                print(f"Weird: Fs of topic {topic} is {Fs} Sa/s is different to the common Fs = {timeAxis['Fs'] } Sa/s! The topic is ignored!", file=sys.stderr)
+                print(f"Weird: Fs of topic {topic} is {Fs} Sa/s is different from the common Fs = {timeAxis['Fs'] } Sa/s! The topic is ignored!", file=sys.stderr)
                 bIgnoreTopic = True
 
             # Find the column where to write the data
-            try:
-                colInx = json_config["MQTT"]["TopicsToSubscribe"].index(topic)
-            except ValueError:
-                colInx = -1
+            cnt = 0
+            colInx = -1
+            for topic_str in json_config["MQTT"]["TopicsToSubscribe"]:
+                if mqtt.topic_matches_sub(json_config["MQTT"]["TopicsToSubscribe"][cnt], topic):
+                    colInx = cnt
+                    print(f"Found: topic {topic} is no. {cnt} in the list")
+                    break
+                cnt += 1
+            if colInx == -1:
                 print(f"Weird: topic {topic} is not in the list of the TopicsToSubscribe in the config file! Ignored!", file=sys.stderr)
                 bIgnoreTopic = True
             
@@ -106,83 +112,84 @@ def on_message(client, userdata, msg):
                 #                0         1      2   3       4     5     6     7                     8                      9
                 myDict[myKey] = [nSamples, cType, Fs, colInx, None, None, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
     else:
-        if myKey in myDict:
-            # Parse the payload
-            payload = msg.payload
-            descriptorLength, metadataVer = struct.unpack_from('HH', payload)
-            # how many samples and what's its type, float or double?
-            cType = myDict[myKey][1]
-            nSamples = myDict[myKey][0]
-            if nSamples == -1: # unknown or variable
-                # calculate nSamples from the payload length
-                payload_len = len(payload)
-                nSamples = (payload_len-descriptorLength)/struct.calcsize(cType)
+        if len(myDict) == len(json_config["MQTT"]["TopicsToSubscribe"]):
+            if myKey in myDict:            
+                # Parse the payload
+                payload = msg.payload
+                descriptorLength, metadataVer = struct.unpack_from('HH', payload)
+                # how many samples and what's its type, float or double?
+                cType = myDict[myKey][1]
+                nSamples = myDict[myKey][0]
+                if nSamples == -1: # unknown or variable
+                    # calculate nSamples from the payload length
+                    payload_len = len(payload)
+                    nSamples = (payload_len-descriptorLength)/struct.calcsize(cType)
 
-            strBinFormat = str(nSamples) + str(cType)  # e.g., '640f' for 640 floats
-            # data
-            data = np.array(struct.unpack_from(strBinFormat, payload, offset=descriptorLength))
-            # time stamp
-            secFromEpoch = struct.unpack_from('Q', payload, 4)[0]
-            nanosec = struct.unpack_from('Q', payload, 12)[0]
+                strBinFormat = str(nSamples) + str(cType)  # e.g., '640f' for 640 floats
+                # data
+                data = np.array(struct.unpack_from(strBinFormat, payload, offset=descriptorLength))
+                # time stamp
+                secFromEpoch = struct.unpack_from('Q', payload, 4)[0]
+                nanosec = struct.unpack_from('Q', payload, 12)[0]
 
-            if myDict[myKey][7] == 0:
-                # initialize the beginning of the topic-specific time axis
-                myDict[myKey][7] = secFromEpoch
-                myDict[myKey][8] = nanosec
+                if myDict[myKey][7] == 0:
+                    # initialize the beginning of the topic-specific time axis
+                    myDict[myKey][7] = secFromEpoch
+                    myDict[myKey][8] = nanosec
 
-            # Same for the global time axis
-            if timeAxis[OriginSecFromEpoch] == 0:
-                timeAxis["OriginSecFromEpoch"] = secFromEpoch
-                timeAxis["Nanosec"] = nanosec
-                # TODO: Here is the nice spot to allocate the readBuffer, as we possess more information than before 
+                # Same for the global time axis
+                if timeAxis["OriginSecFromEpoch"] == 0:
+                    timeAxis["OriginSecFromEpoch"] = secFromEpoch
+                    timeAxis["Nanosec"] = nanosec
+                    # TODO: Here is the nice spot to allocate the readBuffer, as we possess more information than before 
 
-            # Compute the index where to copy the data
-            print(f"{nSamples} samples at {secFromEpoch}:{nanosec} s.")
+                # Compute the index where to copy the data
+                print(f"{nSamples} samples at {secFromEpoch}:{nanosec} s.")
 
-            # Compute the interval between the current timestamp and the timestamp at the start
-            delta_sec = secFromEpoch - timeAxis["OriginSecFromEpoch"]
-            delta_nsec = nanosec - timeAxis["Nanosec"]
-            if delta_nsec < 0:
-                delta_nsec += 1000000000
-                delta_sec -= 1
-            # convert to microsec
-            delta_mjus = delta_sec * 1000000.0 + delta_nsec / 1000.0
-            # finally, the inx
-            rowInx = round(delta_mjus * (myDict[myKey][2] / 1000000.0))
-            print(f"delta = {delta_mjus} mjus. inx = {rowInx}")
+                # Compute the interval between the current timestamp and the timestamp at the start
+                delta_sec = secFromEpoch - timeAxis["OriginSecFromEpoch"]
+                delta_nsec = nanosec - timeAxis["Nanosec"]
+                if delta_nsec < 0:
+                    delta_nsec += 1000000000
+                    delta_sec -= 1
+                # convert to microsec
+                delta_mjus = delta_sec * 1000000.0 + delta_nsec / 1000.0
+                # finally, the inx
+                rowInx = round(delta_mjus * (myDict[myKey][2] / 1000000.0))
+                print(f"delta = {delta_mjus} mjus. inx = {rowInx}")
 
-            # waiting the buffer to be available
-            while bReadingReadBuffer:                
-                # print("Waiting for bReadingReadBuffer")
-                time.sleep(0.01)  # make the thread sleep
+                # waiting the buffer to be available
+                while bReadingReadBuffer:                
+                    # print("Waiting for bReadingReadBuffer")
+                    time.sleep(0.01)  # make the thread sleep
 
-            # check and write...
-            bWritingReadBuffer = True
-            bGoWrite = True
-            if rowInx < 0:
-                # a valid scenario: this is a delayed data chunk
-                # TODO: we can consider reallocating everything to include this datachunk, if it is not superdelayed
-                # for now, we just ignore it
-                print(f"The dealyed from topic {msg.topic} is ignored!", file=sys.stderr)
-                bGoWrite = False
-            elif rowInx >= readBuffer.shape[0]:
-                # readBuffer overrun scenario
-                print(f"readBuffer overrun (1)!", file=sys.stderr)
-                bGoWrite = False
-            elif rowInx+nSamples >= readBuffer.shape[0]:
-                # readBuffer overrun scenario
-                print(f"readBuffer overrun (2)!", file=sys.stderr)
-                bGoWrite = False
-            else:
-                # everything seems okay
+                # check and write...
+                bWritingReadBuffer = True
                 bGoWrite = True
-                readBuffer[rowInx:rowInx+nSamples, myDict[myKey][3]] = data
+                if rowInx < 0:
+                    # a valid scenario: this is a delayed data chunk
+                    # TODO: we can consider reallocating everything to include this datachunk, if it is not superdelayed
+                    # for now, we just ignore it
+                    print(f"The dealyed from topic {msg.topic} is ignored!", file=sys.stderr)
+                    bGoWrite = False
+                elif rowInx >= readBuffer.shape[0]:
+                    # readBuffer overrun scenario
+                    print(f"readBuffer overrun (1)!", file=sys.stderr)
+                    bGoWrite = False
+                elif rowInx+nSamples >= readBuffer.shape[0]:
+                    # readBuffer overrun scenario
+                    print(f"readBuffer overrun (2)!", file=sys.stderr)
+                    bGoWrite = False
+                else:
+                    # everything seems okay
+                    bGoWrite = True
+                    readBuffer[rowInx:rowInx+nSamples, myDict[myKey][3]] = data
 
-            bWritingReadBuffer = False
+                bWritingReadBuffer = False
         else:
             print("Waiting for the metadata...")
     
-            bWritingMyDict = False
+    bWritingMyDict = False
 
 
 def main():
