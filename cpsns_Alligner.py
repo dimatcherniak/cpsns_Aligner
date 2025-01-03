@@ -1,41 +1,48 @@
 """
 This program will
-1. read CP-SENS MQTT messages, both data and metadata
-2. plot the data
+1. Read the JSON config file
+a. MQTT:
+- M: list of length M of topics to subscribe
+- QoS
+- ClientID
+b. Time axis
+- N: How many samples to collect
+2. Subscribes to SEVERAL MQTT topics listed in the config file or (not recommended, not supported initially) to one topic using a wildcard 
+3. Collects the payloads to form a binary data chunk N x M making sure the data are alligned (share the same time axis)
+4. When ready, publishes the JSON string explaining the data
 """
-import matplotlib.pyplot as plt
 import numpy as np
 from paho.mqtt.client import Client as MQTTClient
 from paho.mqtt.client import CallbackAPIVersion
 from paho.mqtt.client import MQTTv311
-import queue
 import struct
 import time
 import argparse
+import os
+import sys
 import json
 
-HOST_DEFAULT = "dtl-server-2.st.lab.au.dk"
-PORT_DEFAULT = 8090
-USERNAME_DEFAULT = "hbk1"
-PASSWORD_DEFAULT = "hbk1shffd"
-MQTT_TOPIC_DEFAULT = "cpsens/+/+/1/acc/raw/+"  # "cpsens/+/+/1/+/+/data"
+CONFIG_FILE_DEFAULT = "config.json"
 
 myDict = {}
 bReadingMyDict = False
 bWritingMyDict = False
-strMQTTTopic = MQTT_TOPIC_DEFAULT
 
+json_config = {}
 
 mqttc = MQTTClient(callback_api_version=CallbackAPIVersion.VERSION2, protocol=MQTTv311)
 
 
 def on_connect(mqttc, userdata, flags, rc, properties=None):
-    print("connected with response code %s" % rc)
-    mqttc.subscribe(strMQTTTopic)
+    global json_config
+    print("Connected with response code %s" % rc)
+    for topic in json_config["MQTT"]["TopicsToSubscribe"]:
+        print(f"Subscribing to the topic {topic}...")
+        mqttc.subscribe(topic, qos=json_config["MQTT"]["QoS"])
 
 
 def on_subscribe(self, mqttc, userdata, msg, granted_qos):
-    print("mid/response = " + str(msg) + " / " + str(granted_qos))
+    print(f"Subscribed to {msg}")
 
 
 def on_message(client, userdata, msg):
@@ -67,41 +74,61 @@ def on_message(client, userdata, msg):
             json_metadata = json.loads(msg.payload)
             nSamples = json_metadata['Data']['Samples']
             cType = json_metadata['Data']['Type'][0]
+            if cType != 'f' and cType != 'd':
+                print(f"Unknow type: {cType}", file=sys.stderr)
+                sys.exit(1)
+
             Fs = json_metadata["Analysis chain"][0]["Sampling"]
-            # Need to know: physical quantity, units
-            strPhysQuantity = json_metadata["Analysis chain"][-1]["Output"]
-            strUnits = json_metadata["Data"]["Unit"]
             secAtAcqusitionStart = 0
-            usTimeStamp = 0
-            #                0         1      2   3                4         5              6     7                     8
-            myDict[myKey] = [nSamples, cType, Fs, strPhysQuantity, strUnits, queue.Queue(), None, secAtAcqusitionStart, usTimeStamp]
+            nsecAtAcqusitionStart = 0
+            #                0         1      2   3     4     5     6     7                     8                      9
+            myDict[myKey] = [nSamples, cType, Fs, None, None, None, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
     else:
         if myKey in myDict:
-            nSamples = myDict[myKey][0]
-            cType = myDict[myKey][1]
             # Parse the payload
             payload = msg.payload
             descriptorLength, metadataVer = struct.unpack_from('HH', payload)
+            # how many samples and what's its type, float or double?
+            cType = myDict[myKey][1]
+            nSamples = myDict[myKey][0]
+            if nSamples == -1: # unknown or variable
+                # calculate nSamples from the payload length
+                payload_len = len(payload)
+                nSamples = (payload_len-descriptorLength)/struct.calcsize(cType)
+
             strBinFormat = str(nSamples) + str(cType)  # e.g., '640f' for 640 floats
             # data
-            data = np.array(struct.unpack_from(strBinFormat, payload, descriptorLength))
+            data = np.array(struct.unpack_from(strBinFormat, payload, offset=descriptorLength))
             # time stamp
             secFromEpoch = struct.unpack_from('Q', payload, 4)[0]
             nanosec = struct.unpack_from('Q', payload, 12)[0]
 
             if myDict[myKey][7] == 0:
+                # initialize the beginning of the time axis
                 myDict[myKey][7] = secFromEpoch
+                myDict[myKey][8] = nanosec
+                """ Will be using a global 2D array
+                # allocate the array 
+                if cType=='d':
+                    myDict[myKey][5] = np.full(nSamples, np.nan, dtype=np.float64)
+                else:
+                    myDict[myKey][5] = np.full(nSamples, np.nan, dtype=np.float32)
+                """
 
-            # Adjust to be inside the DOUBLE resolution
-            secFromAcquisitionStart = secFromEpoch - myDict[myKey][7]
-            # Time stamp is the time in microsec (us) from the data acqusition start
-            usTimeStamp = secFromAcquisitionStart * 1e6 + nanosec * 1e-3  # e(-9+6)
-            # Dima 18-Dec
-            print(f"Current time: {usTimeStamp/1000000} s")
-            # end Dima 18-Dec
-            myDict[myKey][8] = usTimeStamp
-            # Update the dictionary
-            myDict[myKey][5].put(data)
+            # Compute the index where to copy the data
+            print(f"{nSamples} samples at {secFromEpoch}:{nanosec} s.")
+
+            # Compute the interval between the current timestamp and the timestamp at the start
+            delta_sec = secFromEpoch - myDict[myKey][7]
+            delta_nsec = nanosec - myDict[myKey][8]
+            if delta_nsec < 0:
+                delta_nsec += 1000000000
+                delta_sec -= 1
+            # convert to microsec
+            delta_mjus = delta_sec * 1000000.0 + delta_nsec / 1000.0
+            inx = round(delta_mjus * (myDict[myKey][2] / 1000000.0))
+            print(f"delta = {delta_mjus} mjus. inx = {inx}")
+            
         else:
             print("Waiting for the metadata...")
     
@@ -109,49 +136,67 @@ def on_message(client, userdata, msg):
 
 
 def main():
-    global strMQTTTopic
     global myDict, bReadingMyDict, bWritingMyDict
+    global json_config
+    global outputArray
+
     # Parse command line parameters
     # Create the parser
-    parser = argparse.ArgumentParser(description="This Python script reads the time data from MQTT and outputs it on a life graph.")
-    parser.add_argument('--host', type=str, help='Specify the host to connect to. Defaults to ' + HOST_DEFAULT, default=HOST_DEFAULT)
-    parser.add_argument('--port', type=int, help='Connect to the port specified. Defaults to ' + str(PORT_DEFAULT), default=PORT_DEFAULT)
-    parser.add_argument('--username', type=str, help='Provide a username to be used for authenticating with the broker. See also the --pw argument. Defaults to ' + USERNAME_DEFAULT, default=USERNAME_DEFAULT)
-    parser.add_argument('--pw', type=str, help='Provide a password to be used for authenticating with the broker. See also the --username option. Defaults to ' + PASSWORD_DEFAULT, default=PASSWORD_DEFAULT)
-    parser.add_argument('--topic', type=str, help='The topic parameter. Defaults to ' + MQTT_TOPIC_DEFAULT, default=MQTT_TOPIC_DEFAULT)
+    parser = argparse.ArgumentParser(description="""This program 
+1. reads the JSON config file
+a. MQTT:
+- M: list of length M of topics to subscribe
+- QoS
+- ClientID
+b. Time axis
+- N: How many samples to collect
+2. Subscribes to SEVERAL MQTT topics listed in the config file or (not recommended, not supported initially) to one topic using a wildcard 
+3. Collects the payloads to form a binary data chunk N x M making sure the data are alligned (share the same time axis)
+4. When ready, publishes the JSON string explaining the data
+""")
+    parser.add_argument('--config', type=str, help='Specify the JSON configuration file. Defaults to ' + CONFIG_FILE_DEFAULT, default=CONFIG_FILE_DEFAULT)
 
     # Parse the arguments
     args = parser.parse_args()
 
-    strMQTTTopic = args.topic
+    # Name of the configuration file
+    strConfigFile = args.config
 
+    print(f"Reading configuration from {strConfigFile}...")
+    if os.path.exists(strConfigFile):
+        try:
+            # Open and read the JSON file
+            with open(strConfigFile, 'r') as file:
+                json_config = json.load(file)
+        except json.JSONDecodeError:
+            print(f"Error: The file {strConfigFile} exists but could not be parsed as JSON.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"Error: The file {strConfigFile} does not exist.", file=sys.stderr)    
+        sys.exit(1)
+
+    # allocate the output array (32-bit float, despite the input data type)
+
+    nSamplesToCollect = json_config["Output"]["SamplesToCollect"]
+    nChannelsToObserve = len(json_config["MQTT"]["TopicsToSubscribe"])
+    print(f"nSamplesToCollect={nSamplesToCollect}, nChannelsToObserve={nChannelsToObserve}")
+    outputArray = np.full((nSamplesToCollect, nChannelsToObserve), np.nan, dtype=np.float32)
+    
     # Set username and password
-    mqttc.username_pw_set(args.username, args.pw)
+    if json_config["MQTT"]["userId"] != "":
+        mqttc.username_pw_set(json_config["MQTT"]["userId"], json_config["MQTT"]["password"])
 
     mqttc.on_connect = on_connect
     mqttc.on_message = on_message
     mqttc.on_subscribe = on_subscribe
-    mqttc.connect(args.host, args.port, 60)
+    mqttc.connect(json_config["MQTT"]["host"], json_config["MQTT"]["port"], 60)
 
     mqttc.loop_start()
 
-    # initiate the plt
-    plt.ion()
-    fig, ax = plt.subplots()
-    # New: grid lines
-    ax.grid(True)
-    # Labels
-    ax.set_xlabel('Time, s')
-
-    last_redraw_time = time.time()
     while True:
-        # Dima 18-Dec
-        current_time = time.time()
-        if current_time-last_redraw_time >= 0.1:
-            bNeedToRedraw = True
-            last_redraw_time=current_time
-        else:
-            bNeedToRedraw = False
+
+        time.sleep(1)
+        continue
 
         while bWritingMyDict:
             # make the thread sleep
@@ -184,48 +229,6 @@ def main():
         bReadingMyDict = False
         time.sleep(0.1) # Dima 16-Dec
 
-    """
-    # initiate the plt
-    plt.ion()
-    fig, ax = plt.subplots()
-    timeAxis = np.linspace(0, 3 * nPackSize / Fs, 3 * nPackSize)
-    line1, = ax.plot(timeAxis, np.zeros(3 * nPackSize))
-    line2, = ax.plot(timeAxis, np.zeros(3 * nPackSize))
-    # New: grid lines
-    ax.grid(True)
-    # Labels
-    ax.set_xlabel('Time, s')
-    ax.set_ylabel('Acceleration, m/s^2')
-    # Limits
-    plt.ylim(-2, 2)
-
-    while True:
-        bNeedToRedraw = False
-        if not data_queue_ch1.empty():
-            data = data_queue_ch1.get()
-            # line1.set_xdata(np.linspace(timeStamp_ch1,timeStamp_ch1 + 1e6*nPackSize/Fs ,nPackSize)) # timeStamp_ch1 in us
-            # current data
-            curData = line1.get_ydata()
-            curData = np.roll(curData, -nPackSize)
-            curData[-nPackSize:] = data
-            line1.set_ydata(curData)
-            bNeedToRedraw = True
-        if not data_queue_ch2.empty():
-            data = data_queue_ch2.get()
-            # line2.set_xdata(np.linspace(timeStamp_ch2,timeStamp_ch2 + 1e6*nPackSize/Fs ,nPackSize))
-            curData = line2.get_ydata()
-            curData = np.roll(curData, -nPackSize)
-            curData[-nPackSize:]=data
-            line2.set_ydata(curData)
-            bNeedToRedraw = True
-        if bNeedToRedraw:
-            fig.canvas.draw()
-            fig.canvas.flush_events()
-
-        # Sleep for a short time to reduce CPU usage
-        time.sleep(0.1)
-        pass
-    """
 
 if __name__ == "__main__":
     main()
