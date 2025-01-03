@@ -31,22 +31,21 @@ bWritingMyDict = False
 bReadingReadBuffer = False
 bWritingReadBuffer = False
 
+# MQTT
+bConnected = False
+
 json_config = {}
 
 mqttc = MQTTClient(callback_api_version=CallbackAPIVersion.VERSION2, protocol=MQTTv311)
 
 
 def on_connect(mqttc, userdata, flags, rc, properties=None):
-    global json_config
+    global bConnected
     print("Connected with response code %s" % rc)
-    for topic in json_config["MQTT"]["TopicsToSubscribe"]:
-        print(f"Subscribing to the topic {topic}...")
-        mqttc.subscribe(topic, qos=json_config["MQTT"]["QoS"])
-
+    bConnected = True
 
 def on_subscribe(self, mqttc, userdata, msg, granted_qos):
     print(f"Subscribed to {msg}")
-
 
 def on_message(client, userdata, msg):
     global myDict, bReadingMyDict, bWritingMyDict
@@ -196,6 +195,7 @@ def main():
     global myDict, bReadingMyDict, bWritingMyDict
     global json_config
     global readBuffer, timeAxis, bReadingReadBuffer, bWritingReadBuffer
+    global bConnected
 
     # Parse command line parameters
     # Create the parser
@@ -252,9 +252,65 @@ b. Time axis
     mqttc.on_connect = on_connect
     mqttc.on_message = on_message
     mqttc.on_subscribe = on_subscribe
+    bConnected = False
     mqttc.connect(json_config["MQTT"]["host"], json_config["MQTT"]["port"], 60)
 
     mqttc.loop_start()
+
+    # wait unitl connected
+    cnt = 0
+    bConnected = False
+    while not bConnected:
+        time.sleep(0.1)
+        cnt += 0.1
+        if cnt >= 5: # wait max 5 sec
+            break
+    
+    if not bConnected:
+        print(f"Cannot connect to the MQTT broker after {cnt} seconds", file=sys.stderr)
+        sys.exit(1)
+
+    # subcribe only to the metadata topics
+    for topic in json_config["MQTT"]["TopicsToSubscribe"]:
+        # replace the last '+' to 'metadata'
+        metadata_topic = topic.rsplit('/', 1)[0] + '/metadata'
+        print(f"Subscribing to the topic {metadata_topic}...")
+        mqttc.subscribe(metadata_topic, qos=json_config["MQTT"]["QoS"])
+
+    # wait unitl all topics received a message but not longer than XX sec
+    waitMaxSeconds = 12
+    cnt = 0
+    print(f"Wait max {waitMaxSeconds} seconds to receive metadata...")
+    while True:
+        if len(myDict) == len(json_config["MQTT"]["TopicsToSubscribe"]):
+            print(f"Subscribed to all {len(myDict)} topics. COntinue.")
+            break
+        if cnt >= waitMaxSeconds:
+            print(f"Timeout is over. Continue...")
+            break
+        time.sleep(0.1)
+        cnt += 0.1
+
+    if len(myDict) == 0:
+        print(f"No metadata from the topics after {waitMaxSeconds} seconds. Execution aborted.", file=sys.stderr)
+        mqttc.disconnect()
+        sys.exit(1)
+    else:
+        print(f"Continue with {len(myDict)} topics...")
+
+    # Unsubcribe from the metadata topics
+    for topic in json_config["MQTT"]["TopicsToSubscribe"]:
+        # replace the last '+' to 'metadata'
+        metadata_topic = topic.rsplit('/', 1)[0] + '/metadata'
+        print(f"Unsubscribing from the topic {metadata_topic}...")
+        mqttc.unsubscribe(metadata_topic)
+
+    # subcribe only to the data topics
+    for topic in json_config["MQTT"]["TopicsToSubscribe"]:
+        # replace the last '+' by 'data'
+        data_topic = topic.rsplit('/', 1)[0] + '/data'
+        print(f"Subscribing to the topic {data_topic}...")
+        mqttc.subscribe(data_topic, qos=json_config["MQTT"]["QoS"])
 
     while True:
 
