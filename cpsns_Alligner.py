@@ -81,8 +81,17 @@ def on_message(client, userdata, msg):
             Fs = json_metadata["Analysis chain"][0]["Sampling"]
             secAtAcqusitionStart = 0
             nsecAtAcqusitionStart = 0
-            #                0         1      2   3     4     5     6     7                     8                      9
-            myDict[myKey] = [nSamples, cType, Fs, None, None, None, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
+
+            # Find the column where to write the data
+            try:
+                colInx = json_config["MQTT"]["TopicsToSubscribe"].index(topic)
+            except ValueError:
+                colInx = -1
+                print(f"Weird: topic {topic} is not in the list of the TopicsToSubscribe in the config file! Ignored!", file=sys.stderr)
+            
+            if colInx != -1:
+                #                0         1      2   3       4     5     6     7                     8                      9
+                myDict[myKey] = [nSamples, cType, Fs, colInx, None, None, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
     else:
         if myKey in myDict:
             # Parse the payload
@@ -126,8 +135,8 @@ def on_message(client, userdata, msg):
                 delta_sec -= 1
             # convert to microsec
             delta_mjus = delta_sec * 1000000.0 + delta_nsec / 1000.0
-            inx = round(delta_mjus * (myDict[myKey][2] / 1000000.0))
-            print(f"delta = {delta_mjus} mjus. inx = {inx}")
+            rowInx = round(delta_mjus * (myDict[myKey][2] / 1000000.0))
+            print(f"delta = {delta_mjus} mjus. inx = {rowInx}")
             
         else:
             print("Waiting for the metadata...")
@@ -138,7 +147,7 @@ def on_message(client, userdata, msg):
 def main():
     global myDict, bReadingMyDict, bWritingMyDict
     global json_config
-    global outputArray
+    global readBuffer, timeAxis
 
     # Parse command line parameters
     # Create the parser
@@ -175,12 +184,14 @@ b. Time axis
         print(f"Error: The file {strConfigFile} does not exist.", file=sys.stderr)    
         sys.exit(1)
 
-    # allocate the output array (32-bit float, despite the input data type)
+    # define the common time axis
+    timeAxis = {"OriginSecFromEpoch": 0, "Nanosec": 0, "Fs": 0}
 
+    # allocate the readbuffer 2D array (32-bit float, despite the input data type)
     nSamplesToCollect = json_config["Output"]["SamplesToCollect"]
     nChannelsToObserve = len(json_config["MQTT"]["TopicsToSubscribe"])
     print(f"nSamplesToCollect={nSamplesToCollect}, nChannelsToObserve={nChannelsToObserve}")
-    outputArray = np.full((nSamplesToCollect, nChannelsToObserve), np.nan, dtype=np.float32)
+    readBuffer = np.full((nSamplesToCollect, nChannelsToObserve), np.nan, dtype=np.float32)
     
     # Set username and password
     if json_config["MQTT"]["userId"] != "":
