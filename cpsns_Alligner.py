@@ -90,8 +90,8 @@ def on_message(client, userdata, msg):
             bIgnoreTopic = False
             if timeAxis["Fs"] == 0:
                 timeAxis["Fs"] = Fs # the first wins
-            else if timeAxis["Fs"] != Fs:
-                print(f"Weird: Fs of topic {topic} is {Fs} Sa/s is different to the common Fs = {timeAxis["Fs"] } Sa/s! The topic is ignored!", file=sys.stderr)
+            elif timeAxis["Fs"] != Fs:
+                print(f"Weird: Fs of topic {topic} is {Fs} Sa/s is different to the common Fs = {timeAxis['Fs'] } Sa/s! The topic is ignored!", file=sys.stderr)
                 bIgnoreTopic = True
 
             # Find the column where to write the data
@@ -165,11 +165,11 @@ def on_message(client, userdata, msg):
                 # for now, we just ignore it
                 print(f"The dealyed from topic {msg.topic} is ignored!", file=sys.stderr)
                 bGoWrite = False
-            else if rowInx >= readBuffer.shape[0]:
+            elif rowInx >= readBuffer.shape[0]:
                 # readBuffer overrun scenario
                 print(f"readBuffer overrun (1)!", file=sys.stderr)
                 bGoWrite = False
-            else if rowInx+nSamples >= readBuffer.shape[0]::
+            elif rowInx+nSamples >= readBuffer.shape[0]:
                 # readBuffer overrun scenario
                 print(f"readBuffer overrun (2)!", file=sys.stderr)
                 bGoWrite = False
@@ -182,7 +182,7 @@ def on_message(client, userdata, msg):
         else:
             print("Waiting for the metadata...")
     
-    bWritingMyDict = False
+            bWritingMyDict = False
 
 
 def main():
