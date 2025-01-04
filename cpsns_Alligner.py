@@ -24,12 +24,12 @@ EVENTS:
 
 import numpy as np
 import math
-import paho.mqtt.client as mqtt
 from paho.mqtt.client import Client as MQTTClient
 from paho.mqtt.client import CallbackAPIVersion
 from paho.mqtt.client import MQTTv311
 import struct
 import time
+from datetime import datetime, timedelta
 import argparse
 import os
 import sys
@@ -42,8 +42,6 @@ CONFIG_FILE_DEFAULT = "config.json"
 myDict = {}
 bReadingMyDict = False
 bWritingMyDict = False
-bReadingReadBuffer = False
-bWritingReadBuffer = False
 
 json_config = {}
 
@@ -53,7 +51,7 @@ mqttc = MQTTClient(callback_api_version=CallbackAPIVersion.VERSION2, protocol=MQ
 class DataStreamEvent(Enum):
     AllGood = 0
     NewChannelDiscovered = 1
-    ChannelDisappear = 2
+    ChannelDisappeared = 2
     ChannelMetadataChanged = 3
 
 currentEvent = DataStreamEvent.AllGood    
@@ -78,8 +76,9 @@ def on_subscribe(self, mqttc, userdata, msg, granted_qos):
 
 
 def on_message(client, userdata, msg):
+    global json_config
     global myDict, bReadingMyDict, bWritingMyDict
-    global readBuffer, timeAxis, bReadingReadBuffer, bWritingReadBuffer
+    global timeAxis
     global currentEvent
 
     topic = msg.topic
@@ -92,8 +91,8 @@ def on_message(client, userdata, msg):
     else:
         raise Exception("Unknown topic: " + substrings[-1])
 
-    # Create a tuple made of the topic string without the last element (data/metadata)
-    myKey = tuple(substrings[:-1])
+    #myKey = tuple(substrings[:-1]) # Create a tuple made of the topic string without the last element (data/metadata)
+    myKey = '/'.join(substrings[:-1]) # Alternative: a string
 
     while bReadingMyDict:
         # make the thread sleep
@@ -122,35 +121,23 @@ def on_message(client, userdata, msg):
             elif timeAxis["Fs"] != Fs:
                 print(f"Weird: Fs of topic {topic} is {Fs} Sa/s is different from the common Fs = {timeAxis['Fs'] } Sa/s! The topic is ignored!", file=sys.stderr)
                 bIgnoreTopic = True
-
-            # Find the column where to write the data
-            cnt = 0
-            colInx = -1
-            for topic_str in json_config["MQTT"]["TopicsToSubscribe"]:
-                if mqtt.topic_matches_sub(json_config["MQTT"]["TopicsToSubscribe"][cnt], topic):
-                    colInx = cnt
-                    print(f"Found: topic {topic} is no. {cnt} in the list")
-                    break
-                cnt += 1
-            if colInx == -1:
-                print(f"Weird: topic {topic} is not in the list of the TopicsToSubscribe in the config file! Ignored!", file=sys.stderr)
-                bIgnoreTopic = True
             
             if not bIgnoreTopic:
-                # TODO: replace the list by a dictionary. This should make programming easier and reduce the confusion with the list indices
-                #                0         1      2   3       4                        5  6     7                     8                      9
-                #myDict[myKey] = [nSamples, cType, Fs, colInx, hash_bytes(msg.payload), 0, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
+                nSamplesToCollect = json_config["Output"]["SamplesToCollect"]
                 myDict[myKey] = {
                     "SamplesInPayload": nSamples, 
                     "DataType": cType, 
                     "SampleRate": Fs, 
-                    "Column": colInx, 
                     "MetadataHashTag": hash_bytes(msg.payload), 
-                    "NextIndex": 0, 
-                    "Reserved": None, 
-                    "SecondsAtReadBufferStart": 0, 
-                    "NanosecondsAtReadBufferStart": 0, 
-                    "MetadataJsonAsByteObject": msg.payload}
+                    "NextIndex": -1, 
+                    "ReadyToFlush": False,
+                    "SecondsAtReadBufferStart": -1, 
+                    "NanosecondsAtReadBufferStart": -1, 
+                    "MetadataJsonAsByteObject": msg.payload,
+                    "LastTimeAccessed": datetime.now(),
+                    "IsDead": False,
+                    "readBuffer": np.full(round(2*nSamplesToCollect), np.nan, dtype=np.float32)
+                    }
                 # New channel:
                 currentEvent = DataStreamEvent.NewChannelDiscovered
                 print(f"   ---> Event: {currentEvent}")
@@ -180,7 +167,7 @@ def on_message(client, userdata, msg):
             secFromEpoch = struct.unpack_from('Q', payload, 4)[0]
             nanosec = struct.unpack_from('Q', payload, 12)[0]
 
-            if myDict[myKey]["SecondsAtReadBufferStart"] == 0:
+            if myDict[myKey]["SecondsAtReadBufferStart"] == -1:
                 # initialize the beginning of the topic-specific time axis
                 myDict[myKey]["SecondsAtReadBufferStart"] = secFromEpoch
                 myDict[myKey]["NanosecondsAtReadBufferStart"] = nanosec
@@ -206,13 +193,7 @@ def on_message(client, userdata, msg):
             rowInx = round(delta_mjus * (timeAxis["Fs"] / 1000000.0))
             print(f"delta = {delta_mjus} mjus. inx = {rowInx}")
 
-            # waiting the buffer to be available
-            while bReadingReadBuffer:                
-                # print("Waiting for bReadingReadBuffer")
-                time.sleep(0.01)  # make the thread sleep
-
             # check and write...
-            bWritingReadBuffer = True
             bGoWrite = True
             if rowInx < 0:
                 # a valid scenario: this is a delayed data chunk
@@ -220,11 +201,11 @@ def on_message(client, userdata, msg):
                 # for now, we just ignore it
                 print(f"The dealyed from topic {msg.topic} is ignored!", file=sys.stderr)
                 bGoWrite = False
-            elif rowInx >= readBuffer.shape[0]:
+            elif rowInx >= myDict[myKey]["readBuffer"].shape[0]:
                 # readBuffer overrun scenario
                 print(f"readBuffer overrun (1)!", file=sys.stderr)
                 bGoWrite = False
-            elif rowInx+nSamples >= readBuffer.shape[0]:
+            elif rowInx+nSamples >= myDict[myKey]["readBuffer"].shape[0]:
                 # readBuffer overrun scenario
                 print(f"readBuffer overrun (2)!", file=sys.stderr)
                 bGoWrite = False
@@ -233,10 +214,10 @@ def on_message(client, userdata, msg):
                 bGoWrite = True
 
             if bGoWrite:                
-                readBuffer[rowInx:rowInx+nSamples, myDict[myKey]["Column"]] = data
+                myDict[myKey]["readBuffer"][rowInx:rowInx+nSamples] = data
                 myDict[myKey]["NextIndex"] = rowInx+nSamples
+                myDict[myKey]["LastTimeAccessed"] = datetime.now()
 
-            bWritingReadBuffer = False
         else:
             print("Waiting for the metadata...")
     
@@ -246,7 +227,7 @@ def on_message(client, userdata, msg):
 def main():
     global myDict, bReadingMyDict, bWritingMyDict
     global json_config
-    global readBuffer, timeAxis, bReadingReadBuffer, bWritingReadBuffer
+    global timeAxis
 
     # Parse command line parameters
     # Create the parser
@@ -292,8 +273,7 @@ def main():
     print(f"nSamplesToCollect={nSamplesToCollect}, nChannelsToObserve={nChannelsToObserve}")
     # the readbuffer should be bigger than the output buffer
     # TODO: make a smart guess for how much bigger! Now hardcoded to 2
-    readBuffer = np.full((round(2*nSamplesToCollect), nChannelsToObserve), np.nan, dtype=np.float32)
-    bReadingReadBuffer = False
+    #readBuffer = np.full((round(2*nSamplesToCollect), nChannelsToObserve), np.nan, dtype=np.float32)
     bWritingMyDict = False
     
     # MQTT stuff
@@ -309,8 +289,12 @@ def main():
     mqttc.loop_start()
     # MQTT done
 
+    currentEvent = DataStreamEvent.AllGood
+
     fileCnt = 1
+    verCnt = 0
     while True:
+
         # Check if the data needs to be flushed to the destination
         # If I have sufficient data in the readBuffer
         # Check this iterating myDict
@@ -319,52 +303,108 @@ def main():
             time.sleep(0.01)
         bReadingMyDict = True
 
-        nTopicsReadyToFlush = 0
-        bReadyToFlush = False
+        if currentEvent != DataStreamEvent.AllGood:
+            print(f"======== Event {currentEvent} detected! Reset all!")
+            myDict = {}
+            timeAxis = {"OriginSecFromEpoch": 0, "Nanosec": 0, "Fs": 0}
+            # to generate the file name
+            fileCnt = 1
+            verCnt += 1
+            currentEvent = DataStreamEvent.AllGood
+            
         for myKey in myDict:
             if myDict[myKey]["NextIndex"] > nSamplesToCollect:
                 # this topic is ready
-                nTopicsReadyToFlush += 1
-            if nTopicsReadyToFlush == len(myDict):
-                bReadyToFlush = True
-        bReadingMyDict = False
-
-        if bReadyToFlush:
-            # Wait the buffer
-            while bWritingReadBuffer:
-                time.sleep(0.01)
-            bReadingReadBuffer = True
-
-            # Flushing to the destination
-            # TODO: depending of the destination, whose the right format
-            np.save(f"/workspace/common/hbk/Python_code/cpsns_Alligner/dima_{fileCnt}.npy", readBuffer[0:nSamplesToCollect, :])
-            fileCnt += 1
-            print("File saved!")
-            # Reshaffle the buffer
-            nSamplesToMove = readBuffer.shape[0]-nSamplesToCollect
-            readBuffer[0:nSamplesToMove, :] = readBuffer[nSamplesToMove:, :] # memcpy
-            readBuffer[nSamplesToMove:, :].fill(np.nan)            
-            # Change the global time axis origin
-            timeIntervalInSec = nSamplesToMove / timeAxis["Fs"]
-            timeIntervalinWholeSec = math.floor(timeIntervalInSec)
-            timeIntervalNanosec = round(1000000000 * (timeIntervalInSec-timeIntervalinWholeSec))
-            print(f'Before: Whole sec {timeAxis["OriginSecFromEpoch"]}:{timeAxis["Nanosec"]}')
-            timeAxis["OriginSecFromEpoch"] += timeIntervalinWholeSec
-            timeAxis["Nanosec"] += timeIntervalNanosec
-            if timeAxis["Nanosec"] >= 1000000000:
-                timeAxis["Nanosec"] -= 1000000000        
-                timeAxis["OriginSecFromEpoch"] += 1
-            print(f'After: Whole sec {timeAxis["OriginSecFromEpoch"]}:{timeAxis["Nanosec"]}')
-            # reset sample counter
+                myDict[myKey]["ReadyToFlush"] = True
+            else:
+                myDict[myKey]["ReadyToFlush"] = False
+                # is the channel dead?
+                timeSinceLastTimeAccessed = datetime.now()-myDict[myKey]["LastTimeAccessed"]
+                if timeSinceLastTimeAccessed.total_seconds() > 0.5 * nSamplesToCollect / timeAxis["Fs"]: # not accessed since a half of the period
+                    myDict[myKey]["IsDead"] = True
+                    print(f"Channel {myKey} is declared DEAD: no data for the last {timeSinceLastTimeAccessed.total_seconds()} sec.", file=sys.stderr)
+                else:
+                    # give it a little time to try
+                    myDict[myKey]["IsDead"] = False
+        
+        # Analyse the state and decide what to do...
+        # Rules: 
+        # Rule 1, Priority 1: at least one channel is dead --> flush ALL channels and raise ChannelDisapperared flag
+        # Rule 2, Priority 2: no dead channels but not channels are ready to flush --> go next iteration
+        # Rule 3, Priority 3: no dead channels, all channels are ready to flush --> flush
+        # Rule 1
+        bThereAreDeadChannels = False
+        for myKey in myDict:
+            if myDict[myKey]["IsDead"]:
+                currentEvent = DataStreamEvent.ChannelDisappeared # this will restart at the next iteration
+                bThereAreDeadChannels = True
+                break
+        # Rule 2
+        bAllChannelsReady = True
+        if not bThereAreDeadChannels:
             for myKey in myDict:
+                if not myDict[myKey]["ReadyToFlush"]:
+                    bAllChannelsReady = False
+                    break
+        
+        if len(myDict) > 0 and (bThereAreDeadChannels or bAllChannelsReady): # see the rules above
+            # What column of the array to write? I can only guarantee the alphabetical order!
+            # Then in case if the measurement stopped and proceed again, it would be easier (though, not guarantied!) to continue
+            keysList = sorted(list(myDict.keys()))
+
+            # JSON describing the data file
+            listMetadata = []            
+            for myKey in myDict:
+                # get the metadata string...
+                json_metadata = json.loads(myDict[myKey]["MetadataJsonAsByteObject"])
+                listMetadata.insert(keysList.index(myKey), json_metadata)
+            
+            jsonFileDecription = {
+                "TimeAxis": {
+                    "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
+                    "Nanosec": timeAxis["Nanosec"],
+                    "Fs": 4096},                
+                "Channels": listMetadata}
+            with open(f"/workspace/common/hbk/Python_code/cpsns_Alligner/dima_{1000*verCnt+fileCnt}.json", "w") as json_descr_file:
+                json.dump(jsonFileDecription, json_descr_file, indent=4)
+
+            # Array to be flushed:
+            arrayToFlush = np.full((nSamplesToCollect, len(myDict)), np.nan, dtype=np.float32)
+            bTimeAxisUpdated = False
+            for myKey in myDict:
+                nSamplesToMove = myDict[myKey]["readBuffer"].shape[0]-nSamplesToCollect
+                arrayToFlush[:,keysList.index(myKey)] = myDict[myKey]["readBuffer"][0:nSamplesToMove]
+                # Reshaffle the buffer
+                myDict[myKey]["readBuffer"][0:nSamplesToMove] = myDict[myKey]["readBuffer"][nSamplesToMove:] # memcpy
+                myDict[myKey]["readBuffer"][nSamplesToMove:].fill(np.nan)            
+                # Change the global time axis origin
+                if not bTimeAxisUpdated:
+                    timeIntervalInSec = nSamplesToMove / timeAxis["Fs"]
+                    timeIntervalinWholeSec = math.floor(timeIntervalInSec)
+                    timeIntervalNanosec = round(1000000000 * (timeIntervalInSec-timeIntervalinWholeSec))
+                    #print(f'Before: Whole sec {timeAxis["OriginSecFromEpoch"]}:{timeAxis["Nanosec"]}')
+                    timeAxis["OriginSecFromEpoch"] += timeIntervalinWholeSec
+                    timeAxis["Nanosec"] += timeIntervalNanosec
+                    if timeAxis["Nanosec"] >= 1000000000:
+                        timeAxis["Nanosec"] -= 1000000000        
+                        timeAxis["OriginSecFromEpoch"] += 1
+                    #print(f'After: Whole sec {timeAxis["OriginSecFromEpoch"]}:{timeAxis["Nanosec"]}')
+                    bTimeAxisUpdated = True
+
+                # reset sample counter
                 myDict[myKey]["NextIndex"] = 0
                 
-            bReadingReadBuffer = False
+            # Flushing to the destination
+            # TODO: depending of the destination, chose the right file format
+            np.save(f"/workspace/common/hbk/Python_code/cpsns_Alligner/dima_{1000*verCnt+fileCnt}.npy", arrayToFlush)
+
+            fileCnt += 1
+            print("File saved!")
+
+        bReadingMyDict = False
 
         time.sleep(0.1)
         continue
-
-
 
 if __name__ == "__main__":
     main()
