@@ -11,7 +11,20 @@ b. Time axis
 3. Collects the payloads to form a binary data chunk N x M making sure the data are alligned (share the same time axis)
 4. When ready, publishes the JSON string explaining the data
 """
+
+"""
+Idea (4-Jan-2025)
+Stop storing the data and flush the already accumulated readbuffer in case of EVENTS:
+EVENTS:
+1. A new channel appear (if a new METADATA topic discovered)
+2. A channel disappear (if there is no data for a period of time)
+3. METADATA changes (the new metadata json string does not match the old one)
+4. ...
+"""
+
 import numpy as np
+import math
+import paho.mqtt.client as mqtt
 from paho.mqtt.client import Client as MQTTClient
 from paho.mqtt.client import CallbackAPIVersion
 from paho.mqtt.client import MQTTv311
@@ -20,7 +33,9 @@ import time
 import argparse
 import os
 import sys
+from enum import Enum
 import json
+import hashlib
 
 CONFIG_FILE_DEFAULT = "config.json"
 
@@ -30,25 +45,42 @@ bWritingMyDict = False
 bReadingReadBuffer = False
 bWritingReadBuffer = False
 
-# MQTT
-bConnected = False
-
 json_config = {}
 
 mqttc = MQTTClient(callback_api_version=CallbackAPIVersion.VERSION2, protocol=MQTTv311)
 
+# Events
+class DataStreamEvent(Enum):
+    AllGood = 0
+    NewChannelDiscovered = 1
+    ChannelDisappear = 2
+    ChannelMetadataChanged = 3
+
+currentEvent = DataStreamEvent.AllGood    
+
+# Geherates a hshkey of a string, to make long string comparison faster
+def hash_string(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def hash_bytes(b):
+    return hashlib.sha256(b).digest()    
 
 def on_connect(mqttc, userdata, flags, rc, properties=None):
-    global bConnected
+    global json_config
     print("Connected with response code %s" % rc)
-    bConnected = True
+    for topic in json_config["MQTT"]["TopicsToSubscribe"]:
+        print(f"Subscribing to the topic {topic}...")
+        mqttc.subscribe(topic, qos=json_config["MQTT"]["QoS"])
+
 
 def on_subscribe(self, mqttc, userdata, msg, granted_qos):
     print(f"Subscribed to {msg}")
 
+
 def on_message(client, userdata, msg):
     global myDict, bReadingMyDict, bWritingMyDict
     global readBuffer, timeAxis, bReadingReadBuffer, bWritingReadBuffer
+    global currentEvent
 
     topic = msg.topic
     substrings = topic.split('/')
@@ -90,22 +122,37 @@ def on_message(client, userdata, msg):
             if timeAxis["Fs"] == 0:
                 timeAxis["Fs"] = Fs # the first wins
             elif timeAxis["Fs"] != Fs:
-                print(f"Weird: Fs of topic {topic} is {Fs} Sa/s is different to the common Fs = {timeAxis['Fs'] } Sa/s! The topic is ignored!", file=sys.stderr)
+                print(f"Weird: Fs of topic {topic} is {Fs} Sa/s is different from the common Fs = {timeAxis['Fs'] } Sa/s! The topic is ignored!", file=sys.stderr)
                 bIgnoreTopic = True
 
             # Find the column where to write the data
-            try:
-                colInx = json_config["MQTT"]["TopicsToSubscribe"].index(topic)
-            except ValueError:
-                colInx = -1
+            cnt = 0
+            colInx = -1
+            for topic_str in json_config["MQTT"]["TopicsToSubscribe"]:
+                if mqtt.topic_matches_sub(json_config["MQTT"]["TopicsToSubscribe"][cnt], topic):
+                    colInx = cnt
+                    print(f"Found: topic {topic} is no. {cnt} in the list")
+                    break
+                cnt += 1
+            if colInx == -1:
                 print(f"Weird: topic {topic} is not in the list of the TopicsToSubscribe in the config file! Ignored!", file=sys.stderr)
                 bIgnoreTopic = True
             
             if not bIgnoreTopic:
-                #                0         1      2   3       4     5     6     7                     8                      9
-                myDict[myKey] = [nSamples, cType, Fs, colInx, None, None, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
+                # TODO: replace the list by a dictionary. This should make programming easier and reduce the confusion with the list indices
+                #                0         1      2   3       4                        5  6     7                     8                      9
+                myDict[myKey] = [nSamples, cType, Fs, colInx, hash_bytes(msg.payload), 0, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
+                # New channel:
+                currentEvent = DataStreamEvent.NewChannelDiscovered
+                print(f"   ---> Event: {currentEvent}")
+        else:
+            # check if metadata has changed
+            if hash_bytes(msg.payload) != myDict[myKey][4]:
+                currentEvent = DataStreamEvent.ChannelMetadataChanged
+                print(f"   ---> Event: {currentEvent}")
+
     else:
-        if myKey in myDict:
+        if myKey in myDict:            
             # Parse the payload
             payload = msg.payload
             descriptorLength, metadataVer = struct.unpack_from('HH', payload)
@@ -130,7 +177,7 @@ def on_message(client, userdata, msg):
                 myDict[myKey][8] = nanosec
 
             # Same for the global time axis
-            if timeAxis[OriginSecFromEpoch] == 0:
+            if timeAxis["OriginSecFromEpoch"] == 0:
                 timeAxis["OriginSecFromEpoch"] = secFromEpoch
                 timeAxis["Nanosec"] = nanosec
                 # TODO: Here is the nice spot to allocate the readBuffer, as we possess more information than before 
@@ -147,7 +194,7 @@ def on_message(client, userdata, msg):
             # convert to microsec
             delta_mjus = delta_sec * 1000000.0 + delta_nsec / 1000.0
             # finally, the inx
-            rowInx = round(delta_mjus * (myDict[myKey][2] / 1000000.0))
+            rowInx = round(delta_mjus * (timeAxis["Fs"] / 1000000.0))
             print(f"delta = {delta_mjus} mjus. inx = {rowInx}")
 
             # waiting the buffer to be available
@@ -175,20 +222,22 @@ def on_message(client, userdata, msg):
             else:
                 # everything seems okay
                 bGoWrite = True
+
+            if bGoWrite:                
                 readBuffer[rowInx:rowInx+nSamples, myDict[myKey][3]] = data
+                myDict[myKey][5] = rowInx+nSamples
 
             bWritingReadBuffer = False
         else:
             print("Waiting for the metadata...")
     
-            bWritingMyDict = False
+    bWritingMyDict = False
 
 
 def main():
     global myDict, bReadingMyDict, bWritingMyDict
     global json_config
     global readBuffer, timeAxis, bReadingReadBuffer, bWritingReadBuffer
-    global bConnected
 
     # Parse command line parameters
     # Create the parser
@@ -238,6 +287,7 @@ b. Time axis
     bReadingReadBuffer = False
     bWritingMyDict = False
     
+    # MQTT stuff
     # Set username and password
     if json_config["MQTT"]["userId"] != "":
         mqttc.username_pw_set(json_config["MQTT"]["userId"], json_config["MQTT"]["password"])
@@ -245,101 +295,66 @@ b. Time axis
     mqttc.on_connect = on_connect
     mqttc.on_message = on_message
     mqttc.on_subscribe = on_subscribe
-    bConnected = False
-    mqttc.connect(json_config["MQTT"]["host"], json_config["MQTT"]["port"], 60)
+    mqttc.connect(json_config["MQTT"]["host"], json_config["MQTT"]["port"], 60) # we subscribe to the topics in on_connect callback
 
     mqttc.loop_start()
+    # MQTT done
 
-    # wait unitl connected
-    cnt = 0
-    bConnected = False
-    while not bConnected:
-        time.sleep(0.1)
-        cnt += 0.1
-        if cnt >= 5: # wait max 5 sec
-            break
-    
-    if not bConnected:
-        print(f"Cannot connect to the MQTT broker after {cnt} seconds", file=sys.stderr)
-        sys.exit(1)
-
-    # subcribe only to the metadata topics
-    for topic in json_config["MQTT"]["TopicsToSubscribe"]:
-        # replace the last '+' to 'metadata'
-        metadata_topic = topic.rsplit('/', 1)[0] + '/metadata'
-        print(f"Subscribing to the topic {metadata_topic}...")
-        mqttc.subscribe(metadata_topic, qos=json_config["MQTT"]["QoS"])
-
-    # wait unitl all topics received a message but not longer than XX sec
-    waitMaxSeconds = 12
-    cnt = 0
-    print(f"Wait max {waitMaxSeconds} seconds to receive metadata...")
+    fileCnt = 1
     while True:
-        if len(myDict) == len(json_config["MQTT"]["TopicsToSubscribe"]):
-            print(f"Subscribed to all {len(myDict)} topics. COntinue.")
-            break
-        if cnt >= waitMaxSeconds:
-            print(f"Timeout is over. Continue...")
-            break
+        # Check if the data needs to be flushed to the destination
+        # If I have sufficient data in the readBuffer
+        # Check this iterating myDict
+        # First wait until it is available
+        while bWritingMyDict:
+            time.sleep(0.01)
+        bReadingMyDict = True
+
+        nTopicsReadyToFlush = 0
+        bReadyToFlush = False
+        for myKey in myDict:
+            if myDict[myKey][5] > nSamplesToCollect:
+                # this topic is ready
+                nTopicsReadyToFlush += 1
+            if nTopicsReadyToFlush == len(myDict):
+                bReadyToFlush = True
+        bReadingMyDict = False
+
+        if bReadyToFlush:
+            # Wait the buffer
+            while bWritingReadBuffer:
+                time.sleep(0.01)
+            bReadingReadBuffer = True
+
+            # Flushing to the destination
+            # TODO: depending of the destination, whose the right format
+            np.save(f"/workspace/common/hbk/Python_code/cpsns_Alligner/dima_{fileCnt}.npy", readBuffer[0:nSamplesToCollect, :])
+            fileCnt += 1
+            print("File saved!")
+            # Reshaffle the buffer
+            nSamplesToMove = readBuffer.shape[0]-nSamplesToCollect
+            readBuffer[0:nSamplesToMove, :] = readBuffer[nSamplesToMove:, :] # memcpy
+            readBuffer[nSamplesToMove:, :].fill(np.nan)            
+            # Change the global time axis origin
+            timeIntervalInSec = nSamplesToMove / timeAxis["Fs"]
+            timeIntervalinWholeSec = math.floor(timeIntervalInSec)
+            timeIntervalNanosec = round(1000000000 * (timeIntervalInSec-timeIntervalinWholeSec))
+            print(f'Before: Whole sec {timeAxis["OriginSecFromEpoch"]}:{timeAxis["Nanosec"]}')
+            timeAxis["OriginSecFromEpoch"] += timeIntervalinWholeSec
+            timeAxis["Nanosec"] += timeIntervalNanosec
+            if timeAxis["Nanosec"] >= 1000000000:
+                timeAxis["Nanosec"] -= 1000000000        
+                timeAxis["OriginSecFromEpoch"] += 1
+            print(f'After: Whole sec {timeAxis["OriginSecFromEpoch"]}:{timeAxis["Nanosec"]}')
+            # reset sample counter
+            for myKey in myDict:
+                myDict[myKey][5] = 0
+                
+            bReadingReadBuffer = False
+
         time.sleep(0.1)
-        cnt += 0.1
-
-    if len(myDict) == 0:
-        print(f"No metadata from the topics after {waitMaxSeconds} seconds. Execution aborted.", file=sys.stderr)
-        mqttc.disconnect()
-        sys.exit(1)
-    else:
-        print(f"Continue with {len(myDict)} topics...")
-
-    # Unsubcribe from the metadata topics
-    for topic in json_config["MQTT"]["TopicsToSubscribe"]:
-        # replace the last '+' to 'metadata'
-        metadata_topic = topic.rsplit('/', 1)[0] + '/metadata'
-        print(f"Unsubscribing from the topic {metadata_topic}...")
-        mqttc.unsubscribe(metadata_topic)
-
-    # subcribe only to the data topics
-    for topic in json_config["MQTT"]["TopicsToSubscribe"]:
-        # replace the last '+' by 'data'
-        data_topic = topic.rsplit('/', 1)[0] + '/data'
-        print(f"Subscribing to the topic {data_topic}...")
-        mqttc.subscribe(data_topic, qos=json_config["MQTT"]["QoS"])
-
-    while True:
-
-        time.sleep(1)
         continue
 
-        while bWritingMyDict:
-            # make the thread sleep
-            # print("Waiting for bWritingMyDict")
-            time.sleep(0.01)
-        bReadingMyDict = True    
-
-        for key, val in myDict.items():
-            if not val[5].empty():
-                data = val[5].get()
-                nPackSize = val[0]
-                if val[6] is None:
-                    Fs = val[2]
-                    timeAxis = np.linspace(0, 3 * nPackSize / Fs, 3 * nPackSize)
-                    line, = ax.plot(timeAxis, np.zeros(3 * nPackSize), label=str(key))
-                    plt.legend(loc="upper left")
-                    val[6] = line
-
-                line = val[6]
-                curData = line.get_ydata()
-                curData = np.roll(curData, -nPackSize)
-                curData[-nPackSize:] = data
-                line.set_ydata(curData)
-                #bNeedToRedraw = True # Dima 16-Dec
-
-        if bNeedToRedraw:
-            fig.canvas.draw()
-            fig.canvas.flush_events()
-
-        bReadingMyDict = False
-        time.sleep(0.1) # Dima 16-Dec
 
 
 if __name__ == "__main__":
