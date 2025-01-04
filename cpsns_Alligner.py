@@ -114,8 +114,6 @@ def on_message(client, userdata, msg):
                 sys.exit(1)
 
             Fs = json_metadata["Analysis chain"][0]["Sampling"]
-            secAtAcqusitionStart = 0
-            nsecAtAcqusitionStart = 0
 
             # Check the consistency of the Fs
             bIgnoreTopic = False
@@ -141,13 +139,24 @@ def on_message(client, userdata, msg):
             if not bIgnoreTopic:
                 # TODO: replace the list by a dictionary. This should make programming easier and reduce the confusion with the list indices
                 #                0         1      2   3       4                        5  6     7                     8                      9
-                myDict[myKey] = [nSamples, cType, Fs, colInx, hash_bytes(msg.payload), 0, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
+                #myDict[myKey] = [nSamples, cType, Fs, colInx, hash_bytes(msg.payload), 0, None, secAtAcqusitionStart, nsecAtAcqusitionStart, msg.payload]
+                myDict[myKey] = {
+                    "SamplesInPayload": nSamples, 
+                    "DataType": cType, 
+                    "SampleRate": Fs, 
+                    "Column": colInx, 
+                    "MetadataHashTag": hash_bytes(msg.payload), 
+                    "NextIndex": 0, 
+                    "Reserved": None, 
+                    "SecondsAtReadBufferStart": 0, 
+                    "NanosecondsAtReadBufferStart": 0, 
+                    "MetadataJsonAsByteObject": msg.payload}
                 # New channel:
                 currentEvent = DataStreamEvent.NewChannelDiscovered
                 print(f"   ---> Event: {currentEvent}")
         else:
             # check if metadata has changed
-            if hash_bytes(msg.payload) != myDict[myKey][4]:
+            if hash_bytes(msg.payload) != myDict[myKey]["MetadataHashTag"]:
                 currentEvent = DataStreamEvent.ChannelMetadataChanged
                 print(f"   ---> Event: {currentEvent}")
 
@@ -157,8 +166,8 @@ def on_message(client, userdata, msg):
             payload = msg.payload
             descriptorLength, metadataVer = struct.unpack_from('HH', payload)
             # how many samples and what's its type, float or double?
-            cType = myDict[myKey][1]
-            nSamples = myDict[myKey][0]
+            cType = myDict[myKey]["DataType"]
+            nSamples = myDict[myKey]["SamplesInPayload"]
             if nSamples == -1: # unknown or variable
                 # calculate nSamples from the payload length
                 payload_len = len(payload)
@@ -171,10 +180,10 @@ def on_message(client, userdata, msg):
             secFromEpoch = struct.unpack_from('Q', payload, 4)[0]
             nanosec = struct.unpack_from('Q', payload, 12)[0]
 
-            if myDict[myKey][7] == 0:
+            if myDict[myKey]["SecondsAtReadBufferStart"] == 0:
                 # initialize the beginning of the topic-specific time axis
-                myDict[myKey][7] = secFromEpoch
-                myDict[myKey][8] = nanosec
+                myDict[myKey]["SecondsAtReadBufferStart"] = secFromEpoch
+                myDict[myKey]["NanosecondsAtReadBufferStart"] = nanosec
 
             # Same for the global time axis
             if timeAxis["OriginSecFromEpoch"] == 0:
@@ -224,8 +233,8 @@ def on_message(client, userdata, msg):
                 bGoWrite = True
 
             if bGoWrite:                
-                readBuffer[rowInx:rowInx+nSamples, myDict[myKey][3]] = data
-                myDict[myKey][5] = rowInx+nSamples
+                readBuffer[rowInx:rowInx+nSamples, myDict[myKey]["Column"]] = data
+                myDict[myKey]["NextIndex"] = rowInx+nSamples
 
             bWritingReadBuffer = False
         else:
@@ -241,18 +250,18 @@ def main():
 
     # Parse command line parameters
     # Create the parser
-    parser = argparse.ArgumentParser(description="""This program 
-1. reads the JSON config file
-a. MQTT:
-- M: list of length M of topics to subscribe
-- QoS
-- ClientID
-b. Time axis
-- N: How many samples to collect
-2. Subscribes to SEVERAL MQTT topics listed in the config file or (not recommended, not supported initially) to one topic using a wildcard 
-3. Collects the payloads to form a binary data chunk N x M making sure the data are alligned (share the same time axis)
-4. When ready, publishes the JSON string explaining the data
-""")
+    parser = argparse.ArgumentParser(description="This program" 
+                    "1. reads the JSON config file"
+                    "a. MQTT:"
+                    "- M: list of length M of topics to subscribe"
+                    "- QoS"
+                    "- ClientID"
+                    "b. Time axis"
+                    "- N: How many samples to collect"
+                    "2. Subscribes to SEVERAL MQTT topics listed in the config file or (not recommended, not supported initially) to one topic using a wildcard "
+                    "3. Collects the payloads to form a binary data chunk N x M making sure the data are alligned (share the same time axis)"
+                    "4. When ready, publishes the JSON string explaining the data"
+                    )
     parser.add_argument('--config', type=str, help='Specify the JSON configuration file. Defaults to ' + CONFIG_FILE_DEFAULT, default=CONFIG_FILE_DEFAULT)
 
     # Parse the arguments
@@ -313,7 +322,7 @@ b. Time axis
         nTopicsReadyToFlush = 0
         bReadyToFlush = False
         for myKey in myDict:
-            if myDict[myKey][5] > nSamplesToCollect:
+            if myDict[myKey]["NextIndex"] > nSamplesToCollect:
                 # this topic is ready
                 nTopicsReadyToFlush += 1
             if nTopicsReadyToFlush == len(myDict):
@@ -348,7 +357,7 @@ b. Time axis
             print(f'After: Whole sec {timeAxis["OriginSecFromEpoch"]}:{timeAxis["Nanosec"]}')
             # reset sample counter
             for myKey in myDict:
-                myDict[myKey][5] = 0
+                myDict[myKey]["NextIndex"] = 0
                 
             bReadingReadBuffer = False
 
