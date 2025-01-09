@@ -36,6 +36,7 @@ import sys
 from enum import Enum
 import json
 import hashlib
+from pymongo import MongoClient
 
 CONFIG_FILE_DEFAULT = "config.json"
 
@@ -70,10 +71,8 @@ def on_connect(mqttc, userdata, flags, rc, properties=None):
         print(f"Subscribing to the topic {topic}...")
         mqttc.subscribe(topic, qos=json_config["MQTT"]["QoS"])
 
-
 def on_subscribe(self, mqttc, userdata, msg, granted_qos):
     print(f"Subscribed to {msg}")
-
 
 def on_message(client, userdata, msg):
     global json_config
@@ -229,6 +228,8 @@ def main():
     global json_config
     global timeAxis
 
+    bDatabaseConnectionEstablished = False
+
     # Parse command line parameters
     # Create the parser
     parser = argparse.ArgumentParser(description="This program" 
@@ -365,8 +366,6 @@ def main():
                     "Nanosec": timeAxis["Nanosec"],
                     "Fs": 4096},                
                 "Channels": listMetadata}
-            with open(f"/workspace/common/hbk/Python_code/cpsns_Alligner/dima_{1000*verCnt+fileCnt}.json", "w") as json_descr_file:
-                json.dump(jsonFileDecription, json_descr_file, indent=4)
 
             # Array to be flushed:
             arrayToFlush = np.full((nSamplesToCollect, len(myDict)), np.nan, dtype=np.float32)
@@ -395,8 +394,31 @@ def main():
                 myDict[myKey]["NextIndex"] = 0
                 
             # Flushing to the destination
-            # TODO: depending of the destination, chose the right file format
-            np.save(f"/workspace/common/hbk/Python_code/cpsns_Alligner/dima_{1000*verCnt+fileCnt}.npy", arrayToFlush)
+            if json_config["Output"]["Destination"] == "file":
+                # depending of the destination, chose the right file format
+                with open(f"{json_config["Output"]["DestinationFolder"]}/dima_{1000*verCnt+fileCnt}.json", "w") as json_descr_file:
+                    json.dump(jsonFileDecription, json_descr_file, indent=4)
+                np.save(f"{json_config["Output"]["DestinationFolder"]}/dima_{1000*verCnt+fileCnt}.npy", arrayToFlush)
+            elif json_config["Output"]["Destination"] == "mongodb":
+                if not bDatabaseConnectionEstablished:
+                    bDatabaseConnectionEstablished = True
+                    client = MongoClient(json_config["Output"]["DatabaseConnection"])
+                    db = client[json_config["Output"]["DatabaseName"]]
+                    collection = db[json_config["Output"]["DatabaseCollection"]]
+                
+                # insert the data
+                data = {
+                    "TimeAxis": {
+                        "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
+                        "Nanosec": timeAxis["Nanosec"],
+                        "Fs": 4096},                
+                    "Channels": listMetadata,
+                    "Data": (arrayToFlush.T).tolist()
+                }
+                collection.insert_one(data)
+            else:
+                print(f"Error: Unknown destination: {json_config['Output']['Destination']}", file=sys.stderr)
+                sys.exit(1)
 
             fileCnt += 1
             print("File saved!")

@@ -1,0 +1,24 @@
+{
+    "Output": {
+        "SamplesToCollect": 2000,
+        "Destination": "file",
+        "DestinationFolder": "MQTTData",
+        "Commented_Destination": "mongodb",
+        "Commented_DatabaseConnection": "mongodb://localhost:27018/",
+        "Commented_DatabaseName": "mydatabase_RPi_local",
+        "Commented_DatabaseCollection": "mycollection_RPi_local"
+    },
+    "MQTT": {
+        "host": "dtl-server-2.st.lab.au.dk",
+        "port": 8090,
+        "userId": "dmitri",
+        "password": "DmitriHBK-2023",
+        "ClientID": "cpsns_Alligner_RPi_Black",
+        "QoS": 1,
+        "Comment_1": "the topics must end with '+'!",
+        "TopicsToSubscribe": [
+            "cpsens/+/+/1/acc/raw/+",
+            "cpsens/+/+/2/acc/raw/+"
+        ]
+    }
+}
