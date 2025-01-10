@@ -1,10 +1,14 @@
 {
     "Output": {
-        "SamplesToCollect": 7000,
-        "Destination": "file",
-        "DestinationFolder": "MQTTData",
-        "DestinationFileName": "DAQ_data",
-        "_Destination": "mongodb",
+        "SamplesToCollect": 2000,
+        "Destination": "MQTT",
+        "Explanation: ModifySubtopics": "Denotes how to modify every element of the topic. Empty = do nothing. Not empty = replace by the given string",
+        "ModifySubtopics":
+        ["","","","slctd","","algnd"], 
+        "_1Destination": "file",
+        "_DestinationFolder": "MQTTData",
+        "_DestinationFileName": "DAQ_data",
+        "_2Destination": "mongodb",
         "_DatabaseConnection": "mongodb://localhost:27018/",
         "_DatabaseName": "mydatabase_RPi_local",
         "_DatabaseCollection": "mycollection_RPi_local"

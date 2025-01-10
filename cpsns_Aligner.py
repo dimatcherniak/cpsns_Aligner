@@ -57,12 +57,23 @@ class DataStreamEvent(Enum):
 
 currentEvent = DataStreamEvent.AllGood    
 
+# Replaces the subtopics of the topic by the strings in the list
+def replace_subtopics(topic, replacements):
+    subtopics = topic.split('/')
+    for i in range(min(len(subtopics), len(replacements))):
+        if replacements[i]:
+            subtopics[i] = replacements[i]
+    return '/'.join(subtopics)
+
 # Geherates a hshkey of a string, to make long string comparison faster
 def hash_string(s):
     return hashlib.sha256(s.encode()).hexdigest()
 
 def hash_bytes(b):
     return hashlib.sha256(b).digest()    
+
+def on_publish(client, userdata, mid, arg1, arg2):
+    print(f"Message {mid} published.")
 
 def on_connect(mqttc, userdata, flags, rc, properties=None):
     global json_config
@@ -90,8 +101,7 @@ def on_message(client, userdata, msg):
     else:
         raise Exception("Unknown topic: " + substrings[-1])
 
-    #myKey = tuple(substrings[:-1]) # Create a tuple made of the topic string without the last element (data/metadata)
-    myKey = '/'.join(substrings[:-1]) # Alternative: a string
+    myKey = '/'.join(substrings[:-1]) # Key: a string = the topic without "data" or "metadata"
 
     while bReadingMyDict:
         # make the thread sleep
@@ -198,7 +208,7 @@ def on_message(client, userdata, msg):
                 # a valid scenario: this is a delayed data chunk
                 # TODO: we can consider reallocating everything to include this datachunk, if it is not superdelayed
                 # for now, we just ignore it
-                print(f"The dealyed from topic {msg.topic} is ignored!", file=sys.stderr)
+                print(f"The delayed data from topic {msg.topic} is ignored! Debug info: rowInx = {rowInx}, delta = {delta_mjus} microsec.", file=sys.stderr)
                 bGoWrite = False
             elif rowInx >= myDict[myKey]["readBuffer"].shape[0]:
                 # readBuffer overrun scenario
@@ -285,6 +295,7 @@ def main():
     mqttc.on_connect = on_connect
     mqttc.on_message = on_message
     mqttc.on_subscribe = on_subscribe
+    mqttc.on_publish = on_publish
     mqttc.connect(json_config["MQTT"]["host"], json_config["MQTT"]["port"], 60) # we subscribe to the topics in on_connect callback
 
     mqttc.loop_start()
@@ -360,19 +371,12 @@ def main():
                 json_metadata = json.loads(myDict[myKey]["MetadataJsonAsByteObject"])
                 listMetadata.insert(keysList.index(myKey), json_metadata)
             
-            jsonFileDecription = {
-                "TimeAxis": {
-                    "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
-                    "Nanosec": timeAxis["Nanosec"],
-                    "Fs": 4096},                
-                "Channels": listMetadata}
-
             # Array to be flushed:
-            arrayToFlush = np.full((nSamplesToCollect, len(myDict)), np.nan, dtype=np.float32)
+            arrayToDump = np.full((nSamplesToCollect, len(myDict)), np.nan, dtype=np.float32)
             bTimeAxisUpdated = False
             for myKey in myDict:
                 nSamplesToMove = myDict[myKey]["readBuffer"].shape[0]-nSamplesToCollect
-                arrayToFlush[:,keysList.index(myKey)] = myDict[myKey]["readBuffer"][0:nSamplesToMove]
+                arrayToDump[:,keysList.index(myKey)] = myDict[myKey]["readBuffer"][0:nSamplesToMove]
                 # Reshaffle the buffer
                 myDict[myKey]["readBuffer"][0:nSamplesToMove] = myDict[myKey]["readBuffer"][nSamplesToMove:] # memcpy
                 myDict[myKey]["readBuffer"][nSamplesToMove:].fill(np.nan)            
@@ -381,13 +385,11 @@ def main():
                     timeIntervalInSec = nSamplesToMove / timeAxis["Fs"]
                     timeIntervalinWholeSec = math.floor(timeIntervalInSec)
                     timeIntervalNanosec = round(1000000000 * (timeIntervalInSec-timeIntervalinWholeSec))
-                    #print(f'Before: Whole sec {timeAxis["OriginSecFromEpoch"]}:{timeAxis["Nanosec"]}')
                     timeAxis["OriginSecFromEpoch"] += timeIntervalinWholeSec
                     timeAxis["Nanosec"] += timeIntervalNanosec
                     if timeAxis["Nanosec"] >= 1000000000:
                         timeAxis["Nanosec"] -= 1000000000        
                         timeAxis["OriginSecFromEpoch"] += 1
-                    #print(f'After: Whole sec {timeAxis["OriginSecFromEpoch"]}:{timeAxis["Nanosec"]}')
                     bTimeAxisUpdated = True
 
                 # reset sample counter
@@ -395,33 +397,63 @@ def main():
                 
             # Flushing to the destination
             if json_config["Output"]["Destination"] == "file":
-                # depending of the destination, chose the right file format
-                with open(f"{json_config["Output"]["DestinationFolder"]}/dima_{1000*verCnt+fileCnt}.json", "w") as json_descr_file:
+                # ------- Dump to file ---------------
+                # TODO: depending of the destination, chose the right file format
+                # 1. Saving the description as JSON
+                jsonFileDecription = {
+                    "TimeAxis": {
+                        "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
+                        "Nanosec": timeAxis["Nanosec"],
+                        "TimeAtCollectionStart": f'{datetime.utcfromtimestamp(timeAxis["OriginSecFromEpoch"]) + timedelta(microseconds=timeAxis["Nanosec"] / 1000)}',
+                        "Fs": timeAxis["Fs"]},                
+                    "Channels": listMetadata}
+                with open(f'{json_config["Output"]["DestinationFolder"]}/{json_config["Output"]["DestinationFileName"]}_{1000*verCnt+fileCnt}.json', 'w') as json_descr_file:
                     json.dump(jsonFileDecription, json_descr_file, indent=4)
-                np.save(f"{json_config["Output"]["DestinationFolder"]}/dima_{1000*verCnt+fileCnt}.npy", arrayToFlush)
+                # 2. Saving the data as numpy array in binary form
+                np.save(f'{json_config["Output"]["DestinationFolder"]}/{json_config["Output"]["DestinationFileName"]}_{1000*verCnt+fileCnt}.npy', arrayToDump)
+                fileCnt += 1
+                print("File saved!")
             elif json_config["Output"]["Destination"] == "mongodb":
+                # ------- Dump to MongoDB ---------------
                 if not bDatabaseConnectionEstablished:
                     bDatabaseConnectionEstablished = True
                     client = MongoClient(json_config["Output"]["DatabaseConnection"])
                     db = client[json_config["Output"]["DatabaseName"]]
                     collection = db[json_config["Output"]["DatabaseCollection"]]
-                
+                    # TODO: if the version changed, start saving to the new collection                
                 # insert the data
                 data = {
                     "TimeAxis": {
                         "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
                         "Nanosec": timeAxis["Nanosec"],
-                        "Fs": 4096},                
+                        "TimeAtCollectionStart": datetime.utcfromtimestamp(timeAxis["OriginSecFromEpoch"]) + timedelta(microseconds=timeAxis["Nanosec"] / 1000),
+                        "Fs": timeAxis["Fs"]},                
                     "Channels": listMetadata,
-                    "Data": (arrayToFlush.T).tolist()
+                    "Data": (arrayToDump.T).tolist()
                 }
                 collection.insert_one(data)
+                print("Collection inserted!")
+            elif json_config["Output"]["Destination"] == "MQTT":
+                # ------- Dump to MQTT ---------------
+                # Metadata
+                jsonMetadata = json.dumps({
+                    "TimeAxis": {
+                        "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
+                        "Nanosec": timeAxis["Nanosec"],
+                        "TimeAtCollectionStart": f'{datetime.utcfromtimestamp(timeAxis["OriginSecFromEpoch"]) + timedelta(microseconds=timeAxis["Nanosec"] / 1000)}',
+                        "Fs": timeAxis["Fs"]},                
+                    "Channels": listMetadata}, indent=4)
+                # Generate the new topic
+                newTopic = replace_subtopics(next(iter(myDict)), json_config["Output"]["ModifySubtopics"])
+                newTopicMetadata = newTopic + "/metadata"
+                newTopicData = newTopic + "/data"
+                # Publish
+                mqttc.publish(newTopicMetadata, jsonMetadata, qos=json_config["MQTT"]["QoS"])
+                mqttc.publish(newTopicData, arrayToDump.tobytes(), qos=json_config["MQTT"]["QoS"])
+                print(f"Topics {newTopicMetadata} and {newTopic} attempted to publish!")
             else:
                 print(f"Error: Unknown destination: {json_config['Output']['Destination']}", file=sys.stderr)
                 sys.exit(1)
-
-            fileCnt += 1
-            print("File saved!")
 
         bReadingMyDict = False
 

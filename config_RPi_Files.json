@@ -3,6 +3,7 @@
         "SamplesToCollect": 2000,
         "Destination": "file",
         "DestinationFolder": "MQTTData",
+        "DestinationFileName": "DAQ_data",
         "Commented_Destination": "mongodb",
         "Commented_DatabaseConnection": "mongodb://localhost:27018/",
         "Commented_DatabaseName": "mydatabase_RPi_local",
