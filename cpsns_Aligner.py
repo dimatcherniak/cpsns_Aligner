@@ -138,7 +138,7 @@ def on_message(client, userdata, msg):
                     "DataType": cType, 
                     "SampleRate": Fs, 
                     "MetadataHashTag": hash_bytes(msg.payload), 
-                    "NextIndex": -1, 
+                    "NextIndex": 0, 
                     "ReadyToFlush": False,
                     "SecondsAtReadBufferStart": -1, 
                     "NanosecondsAtReadBufferStart": -1, 
@@ -168,7 +168,7 @@ def on_message(client, userdata, msg):
                 # calculate nSamples from the payload length
                 payload_len = len(payload)
                 nSamples = (payload_len-descriptorLength)/struct.calcsize(cType)
-
+            
             strBinFormat = str(nSamples) + str(cType)  # e.g., '640f' for 640 floats
             # data
             data = np.array(struct.unpack_from(strBinFormat, payload, offset=descriptorLength))
@@ -176,20 +176,46 @@ def on_message(client, userdata, msg):
             secFromEpoch = struct.unpack_from('Q', payload, 4)[0]
             nanosec = struct.unpack_from('Q', payload, 12)[0]
 
-            if myDict[myKey]["SecondsAtReadBufferStart"] == -1:
-                # initialize the beginning of the topic-specific time axis
-                myDict[myKey]["SecondsAtReadBufferStart"] = secFromEpoch
-                myDict[myKey]["NanosecondsAtReadBufferStart"] = nanosec
-
-            # Same for the global time axis
+            # Initialize the global time axis
             if timeAxis["OriginSecFromEpoch"] == 0:
                 timeAxis["OriginSecFromEpoch"] = secFromEpoch
                 timeAxis["Nanosec"] = nanosec
                 # TODO: Here is the nice spot to allocate the readBuffer, as we possess more information than before 
 
+            # Initialize the topic-specific (local) time axis
+            if myDict[myKey]["SecondsAtReadBufferStart"] == -1:                
+                myDict[myKey]["SecondsAtReadBufferStart"] = secFromEpoch
+                myDict[myKey]["NanosecondsAtReadBufferStart"] = nanosec
+                # What if the local and global axes are different?
+                if myDict[myKey]["SecondsAtReadBufferStart"] == timeAxis["OriginSecFromEpoch"] and myDict[myKey]["NanosecondsAtReadBufferStart"] == timeAxis["Nanosec"]:
+                    # the axes starts at the same moment, everything is fine
+                    pass
+                else:
+                    # The axes start at different moments! What to do?
+                    if (myDict[myKey]["SecondsAtReadBufferStart"]+myDict[myKey]["NanosecondsAtReadBufferStart"]/1000000000) < (timeAxis["OriginSecFromEpoch"]+timeAxis["Nanosec"]/1000000000):
+                        # The local axis starts earlier --> not a big deal, warn and wait
+                        print(f"The local time axis for topic {myKey} starts BEFORE the global axis. Waiting until they match...", file=sys.stderr)
+                        myDict[myKey]["SecondsAtReadBufferStart"] = -1
+                        myDict[myKey]["NanosecondsAtReadBufferStart"] = -1
+                    else:                        
+                        # What to do here?
+                        print(f"The local time axis for topic {myKey} starts AFTER the global axis. Adjusting... The output will contain NaNs!", file=sys.stderr)
+                        # TODO: handle the case properly!
+                        # For the time being, a quick solution (the resulting data will contain NaNs!)
+                        myDict[myKey]["SecondsAtReadBufferStart"] = timeAxis["OriginSecFromEpoch"]
+                        myDict[myKey]["NanosecondsAtReadBufferStart"] = timeAxis["Nanosec"]
+                        # pick NextInx from another local axis
+
+
+
+
             # Compute the index where to copy the data
             print(f"{nSamples} samples at {secFromEpoch}:{nanosec} s.")
 
+            """
+            Note: time stamps are APPROXIMATE, and we MUST NOT trust them when calculating the rowInx.
+            We must relay on NextIndex
+            Question: how to ALIGN the channels?
             # Compute the interval between the current timestamp and the timestamp at the start
             delta_sec = secFromEpoch - timeAxis["OriginSecFromEpoch"]
             delta_nsec = nanosec - timeAxis["Nanosec"]
@@ -202,13 +228,18 @@ def on_message(client, userdata, msg):
             rowInx = round(delta_mjus * (timeAxis["Fs"] / 1000000.0))
             print(f"delta = {delta_mjus} mjus. inx = {rowInx}")
 
+            if rowInx != myDict[myKey]["NextIndex"]:
+                print(f"---- Weird: rowInx = {rowInx} != NextIndex {myDict[myKey]['NextIndex']}", file=sys.stderr)
+            """
+            rowInx = myDict[myKey]["NextIndex"]
+
             # check and write...
             bGoWrite = True
             if rowInx < 0:
                 # a valid scenario: this is a delayed data chunk
                 # TODO: we can consider reallocating everything to include this datachunk, if it is not superdelayed
                 # for now, we just ignore it
-                print(f"The delayed data from topic {msg.topic} is ignored! Debug info: rowInx = {rowInx}, delta = {delta_mjus} microsec.", file=sys.stderr)
+                print(f"{datetime.now()} The delayed data from topic {msg.topic} is ignored! Debug info: rowInx = {rowInx}, delta = {delta_mjus} microsec.", file=sys.stderr)
                 bGoWrite = False
             elif rowInx >= myDict[myKey]["readBuffer"].shape[0]:
                 # readBuffer overrun scenario
@@ -395,6 +426,12 @@ def main():
                 # reset sample counter
                 myDict[myKey]["NextIndex"] = 0
                 
+            # Check for nans
+            nan_indices = np.where(np.isnan(arrayToDump[:,0]))
+            if len(nan_indices) != 0:
+                print(f"{len(nan_indices[0])} NaNs in the output array! Indicies: {nan_indices}", file=sys.stderr)
+
+
             # Flushing to the destination
             if json_config["Output"]["Destination"] == "file":
                 # ------- Dump to file ---------------
@@ -426,7 +463,7 @@ def main():
                     "TimeAxis": {
                         "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
                         "Nanosec": timeAxis["Nanosec"],
-                        "TimeAtCollectionStart": datetime.utcfromtimestamp(timeAxis["OriginSecFromEpoch"]) + timedelta(microseconds=timeAxis["Nanosec"] / 1000),
+                        "TimeAtCollectionStart_UTC": datetime.utcfromtimestamp(timeAxis["OriginSecFromEpoch"]) + timedelta(microseconds=timeAxis["Nanosec"] / 1000),
                         "Fs": timeAxis["Fs"]},                
                     "Channels": listMetadata,
                     "Data": (arrayToDump.T).tolist()
@@ -448,6 +485,8 @@ def main():
                 newTopicMetadata = newTopic + "/metadata"
                 newTopicData = newTopic + "/data"
                 # Publish
+                print(f"DEBUG: aray to dump dimensions: {len(arrayToDump.shape)}")
+                print(f"DEBUG: aray to dump dimensions: {arrayToDump.shape[0]} x {arrayToDump.shape[1]}")
                 mqttc.publish(newTopicMetadata, jsonMetadata, qos=json_config["MQTT"]["QoS"])
                 mqttc.publish(newTopicData, arrayToDump.tobytes(), qos=json_config["MQTT"]["QoS"])
                 print(f"Topics {newTopicMetadata} and {newTopic} attempted to publish!")
