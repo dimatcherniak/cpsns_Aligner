@@ -86,6 +86,7 @@ def on_subscribe(self, mqttc, userdata, msg, granted_qos):
     print(f"Subscribed to {msg}")
 
 def on_message(client, userdata, msg):
+    #print(f"on_message: received {msg.topic}")
     global json_config
     global myDict, bReadingMyDict, bWritingMyDict
     global timeAxis
@@ -145,7 +146,7 @@ def on_message(client, userdata, msg):
                     "MetadataJsonAsByteObject": msg.payload,
                     "LastTimeAccessed": datetime.now(),
                     "IsDead": False,
-                    "readBuffer": np.full(round(2*nSamplesToCollect), np.nan, dtype=np.float32)
+                    "dataPayloads": {} # this to be a dictionary, with time stamp as a key and the data as np.array
                     }
                 # New channel:
                 currentEvent = DataStreamEvent.NewChannelDiscovered
@@ -176,87 +177,14 @@ def on_message(client, userdata, msg):
             secFromEpoch = struct.unpack_from('Q', payload, 4)[0]
             nanosec = struct.unpack_from('Q', payload, 12)[0]
 
-            # Initialize the global time axis
+            # Add an entry to the dictionary: the timestamp is the key
+            myDict[myKey]["dataPayloads"][(secFromEpoch, nanosec)] = data
+            print(f"{nSamples} samples at {secFromEpoch}:{nanosec} s.")
+
+            # Initialize the global time axis. TODO: Do I need it? 
             if timeAxis["OriginSecFromEpoch"] == 0:
                 timeAxis["OriginSecFromEpoch"] = secFromEpoch
                 timeAxis["Nanosec"] = nanosec
-                # TODO: Here is the nice spot to allocate the readBuffer, as we possess more information than before 
-
-            # Initialize the topic-specific (local) time axis
-            if myDict[myKey]["SecondsAtReadBufferStart"] == -1:                
-                myDict[myKey]["SecondsAtReadBufferStart"] = secFromEpoch
-                myDict[myKey]["NanosecondsAtReadBufferStart"] = nanosec
-                # What if the local and global axes are different?
-                if myDict[myKey]["SecondsAtReadBufferStart"] == timeAxis["OriginSecFromEpoch"] and myDict[myKey]["NanosecondsAtReadBufferStart"] == timeAxis["Nanosec"]:
-                    # the axes starts at the same moment, everything is fine
-                    pass
-                else:
-                    # The axes start at different moments! What to do?
-                    if (myDict[myKey]["SecondsAtReadBufferStart"]+myDict[myKey]["NanosecondsAtReadBufferStart"]/1000000000) < (timeAxis["OriginSecFromEpoch"]+timeAxis["Nanosec"]/1000000000):
-                        # The local axis starts earlier --> not a big deal, warn and wait
-                        print(f"The local time axis for topic {myKey} starts BEFORE the global axis. Waiting until they match...", file=sys.stderr)
-                        myDict[myKey]["SecondsAtReadBufferStart"] = -1
-                        myDict[myKey]["NanosecondsAtReadBufferStart"] = -1
-                    else:                        
-                        # What to do here?
-                        print(f"The local time axis for topic {myKey} starts AFTER the global axis. Adjusting... The output will contain NaNs!", file=sys.stderr)
-                        # TODO: handle the case properly!
-                        # For the time being, a quick solution (the resulting data will contain NaNs!)
-                        myDict[myKey]["SecondsAtReadBufferStart"] = timeAxis["OriginSecFromEpoch"]
-                        myDict[myKey]["NanosecondsAtReadBufferStart"] = timeAxis["Nanosec"]
-                        # pick NextInx from another local axis
-
-
-
-
-            # Compute the index where to copy the data
-            print(f"{nSamples} samples at {secFromEpoch}:{nanosec} s.")
-
-            """
-            Note: time stamps are APPROXIMATE, and we MUST NOT trust them when calculating the rowInx.
-            We must relay on NextIndex
-            Question: how to ALIGN the channels?
-            # Compute the interval between the current timestamp and the timestamp at the start
-            delta_sec = secFromEpoch - timeAxis["OriginSecFromEpoch"]
-            delta_nsec = nanosec - timeAxis["Nanosec"]
-            if delta_nsec < 0:
-                delta_nsec += 1000000000
-                delta_sec -= 1
-            # convert to microsec
-            delta_mjus = delta_sec * 1000000.0 + delta_nsec / 1000.0
-            # finally, the inx
-            rowInx = round(delta_mjus * (timeAxis["Fs"] / 1000000.0))
-            print(f"delta = {delta_mjus} mjus. inx = {rowInx}")
-
-            if rowInx != myDict[myKey]["NextIndex"]:
-                print(f"---- Weird: rowInx = {rowInx} != NextIndex {myDict[myKey]['NextIndex']}", file=sys.stderr)
-            """
-            rowInx = myDict[myKey]["NextIndex"]
-
-            # check and write...
-            bGoWrite = True
-            if rowInx < 0:
-                # a valid scenario: this is a delayed data chunk
-                # TODO: we can consider reallocating everything to include this datachunk, if it is not superdelayed
-                # for now, we just ignore it
-                print(f"{datetime.now()} The delayed data from topic {msg.topic} is ignored! Debug info: rowInx = {rowInx}, delta = {delta_mjus} microsec.", file=sys.stderr)
-                bGoWrite = False
-            elif rowInx >= myDict[myKey]["readBuffer"].shape[0]:
-                # readBuffer overrun scenario
-                print(f"readBuffer overrun (1)!", file=sys.stderr)
-                bGoWrite = False
-            elif rowInx+nSamples >= myDict[myKey]["readBuffer"].shape[0]:
-                # readBuffer overrun scenario
-                print(f"readBuffer overrun (2)!", file=sys.stderr)
-                bGoWrite = False
-            else:
-                # everything seems okay
-                bGoWrite = True
-
-            if bGoWrite:                
-                myDict[myKey]["readBuffer"][rowInx:rowInx+nSamples] = data
-                myDict[myKey]["NextIndex"] = rowInx+nSamples
-                myDict[myKey]["LastTimeAccessed"] = datetime.now()
 
         else:
             print("Waiting for the metadata...")
@@ -306,17 +234,15 @@ def main():
         print(f"Error: The file {strConfigFile} does not exist.", file=sys.stderr)    
         sys.exit(1)
 
-    # define the common time axis
+    # define the common time axis. TODO: do I need it?
     timeAxis = {"OriginSecFromEpoch": 0, "Nanosec": 0, "Fs": 0}
 
-    # allocate the readbuffer 2D array (32-bit float, despite the input data type)
     nSamplesToCollect = json_config["Output"]["SamplesToCollect"]
     nChannelsToObserve = len(json_config["MQTT"]["TopicsToSubscribe"])
     print(f"nSamplesToCollect={nSamplesToCollect}, nChannelsToObserve={nChannelsToObserve}")
-    # the readbuffer should be bigger than the output buffer
-    # TODO: make a smart guess for how much bigger! Now hardcoded to 2
-    #readBuffer = np.full((round(2*nSamplesToCollect), nChannelsToObserve), np.nan, dtype=np.float32)
+
     bWritingMyDict = False
+    bReadingMyDict = False
     
     # MQTT stuff
     # Set username and password
@@ -346,146 +272,109 @@ def main():
             time.sleep(0.01)
         bReadingMyDict = True
 
-        if currentEvent != DataStreamEvent.AllGood:
-            print(f"======== Event {currentEvent} detected! Reset all!")
-            myDict = {}
-            timeAxis = {"OriginSecFromEpoch": 0, "Nanosec": 0, "Fs": 0}
-            # to generate the file name
-            fileCnt = 1
-            verCnt += 1
-            currentEvent = DataStreamEvent.AllGood
-            
+        # Here it goes the logic to collect the data from the payloadData dictionary for each topic into arrayToDump
+        # 1. Make a temporary time axis (set of keys)
+        tAxis = set()
         for myKey in myDict:
-            if myDict[myKey]["NextIndex"] > nSamplesToCollect:
-                # this topic is ready
-                myDict[myKey]["ReadyToFlush"] = True
-            else:
-                myDict[myKey]["ReadyToFlush"] = False
-                # is the channel dead?
-                timeSinceLastTimeAccessed = datetime.now()-myDict[myKey]["LastTimeAccessed"]
-                if timeSinceLastTimeAccessed.total_seconds() > 0.5 * nSamplesToCollect / timeAxis["Fs"]: # not accessed since a half of the period
-                    myDict[myKey]["IsDead"] = True
-                    print(f"Channel {myKey} is declared DEAD: no data for the last {timeSinceLastTimeAccessed.total_seconds()} sec.", file=sys.stderr)
-                else:
-                    # give it a little time to try
-                    myDict[myKey]["IsDead"] = False
+            tAxis.update(set(myDict[myKey]["dataPayloads"].keys()))
         
-        # Analyse the state and decide what to do...
-        # Rules: 
-        # Rule 1, Priority 1: at least one channel is dead --> flush ALL channels and raise ChannelDisapperared flag
-        # Rule 2, Priority 2: no dead channels but not channels are ready to flush --> go next iteration
-        # Rule 3, Priority 3: no dead channels, all channels are ready to flush --> flush
-        # Rule 1
-        bThereAreDeadChannels = False
-        for myKey in myDict:
-            if myDict[myKey]["IsDead"]:
-                currentEvent = DataStreamEvent.ChannelDisappeared # this will restart at the next iteration
-                bThereAreDeadChannels = True
-                break
-        # Rule 2
-        bAllChannelsReady = True
-        if not bThereAreDeadChannels:
-            for myKey in myDict:
-                if not myDict[myKey]["ReadyToFlush"]:
-                    bAllChannelsReady = False
+        # and convert to a list to make it iterable
+        tAxis = list(sorted(tAxis))
+        print(f"----> tAxis length is {len(tAxis)}")
+
+        jsonMetadata = None
+        arrayToDump = None
+        
+        if len(tAxis) > 0:
+            intrvl = [0]
+            while len(intrvl) > 0:
+                if intrvl[-1] >= len(tAxis):
                     break
-        
-        if len(myDict) > 0 and (bThereAreDeadChannels or bAllChannelsReady): # see the rules above
-            # What column of the array to write? I can only guarantee the alphabetical order!
-            # Then in case if the measurement stopped and proceed again, it would be easier (though, not guarantied!) to continue
-            keysList = sorted(list(myDict.keys()))
+                # collect the keys that fully match the int
+                # assume all keys are in
+                keysThatFullyMatchInterval = set(myDict.keys())
+                for myKey in myDict:
+                    for chnk in intrvl:
+                        ts = tAxis[chnk]
+                        if ts not in myDict[myKey]["dataPayloads"]:
+                            keysThatFullyMatchInterval.discard(myKey) # discard() won't raise error if the key is not there
 
-            # JSON describing the data file
-            listMetadata = []            
-            for myKey in myDict:
-                # get the metadata string...
-                json_metadata = json.loads(myDict[myKey]["MetadataJsonAsByteObject"])
-                listMetadata.insert(keysList.index(myKey), json_metadata)
-            
-            # Array to be flushed:
-            arrayToDump = np.full((nSamplesToCollect, len(myDict)), np.nan, dtype=np.float32)
-            bTimeAxisUpdated = False
-            for myKey in myDict:
-                nSamplesToMove = myDict[myKey]["readBuffer"].shape[0]-nSamplesToCollect
-                arrayToDump[:,keysList.index(myKey)] = myDict[myKey]["readBuffer"][0:nSamplesToMove]
-                # Reshaffle the buffer
-                myDict[myKey]["readBuffer"][0:nSamplesToMove] = myDict[myKey]["readBuffer"][nSamplesToMove:] # memcpy
-                myDict[myKey]["readBuffer"][nSamplesToMove:].fill(np.nan)            
-                # Change the global time axis origin
-                if not bTimeAxisUpdated:
-                    timeIntervalInSec = nSamplesToMove / timeAxis["Fs"]
-                    timeIntervalinWholeSec = math.floor(timeIntervalInSec)
-                    timeIntervalNanosec = round(1000000000 * (timeIntervalInSec-timeIntervalinWholeSec))
-                    timeAxis["OriginSecFromEpoch"] += timeIntervalinWholeSec
-                    timeAxis["Nanosec"] += timeIntervalNanosec
-                    if timeAxis["Nanosec"] >= 1000000000:
-                        timeAxis["Nanosec"] -= 1000000000        
-                        timeAxis["OriginSecFromEpoch"] += 1
-                    bTimeAxisUpdated = True
-
-                # reset sample counter
-                myDict[myKey]["NextIndex"] = 0
+                if len(keysThatFullyMatchInterval) == 0:
+                    intrvl = intrvl[1:] # remove the first element
+                    continue
                 
-            # Check for nans
-            nan_indices = np.where(np.isnan(arrayToDump[:,0]))
-            if len(nan_indices) != 0:
-                print(f"{len(nan_indices[0])} NaNs in the output array! Indicies: {nan_indices}", file=sys.stderr)
+                # number of samples in the interval
+                samplesInInterval = 0
+                theKey = next(iter(keysThatFullyMatchInterval))
+                for chnk in intrvl:                    
+                    samplesInInterval += len(myDict[theKey]["dataPayloads"][tAxis[chnk]])
 
+                # print(f"Number of samples in the interval: {samplesInInterval}")
+                if samplesInInterval > nSamplesToCollect:
+                    print(f"Number of samples has reached the required number: {nSamplesToCollect}. Channels to export: {keysThatFullyMatchInterval}")
+                    # Form the arrayToDump
+                    arrayToDump = np.full((samplesInInterval, len(keysThatFullyMatchInterval)), np.nan, dtype=np.float32)
+                    # To what column of the array to write? I can only guarantee the alphabetical order!
+                    # Sort the keysThatFullyMatchInterval
+                    keysSortedList = sorted(list(keysThatFullyMatchInterval))
+                    for inxClmn in range(len(keysSortedList)):
+                        theKey = keysSortedList[inxClmn]
+                        strt = 0
+                        for chnk in intrvl:
+                            lngs = len(myDict[theKey]["dataPayloads"][tAxis[chnk]])
+                            arrayToDump[strt:strt+lngs, inxClmn] = myDict[theKey]["dataPayloads"][tAxis[chnk]]
+                            strt += lngs
 
+                    # Check for nans in the result
+                    nan_indices = np.where(np.isnan(arrayToDump[:,0]))
+                    if len(nan_indices[0]) != 0:
+                        print(f"{len(nan_indices[0])} NaNs in the output array! Indicies: {nan_indices}", file=sys.stderr)
+
+                    # Form the metadata
+                    listMetadata = []            
+                    for inxClmn in range(len(keysSortedList)):
+                        theKey = keysSortedList[inxClmn]
+                        # get the metadata string...
+                        json_metadata = json.loads(myDict[theKey]["MetadataJsonAsByteObject"])
+                        listMetadata.insert(inxClmn, json_metadata)
+                    
+                    jsonMetadata = json.dumps({
+                        "TimeAxis": {
+                            "StartSecFromEpoch": tAxis[intrvl[0]][0], 
+                            "Nanosec": tAxis[intrvl[0]][1], 
+                            "TimeAtCollectionStart": f'{datetime.utcfromtimestamp(tAxis[intrvl[0]][0]) + timedelta(microseconds=tAxis[intrvl[0]][1] / 1000)}',
+                            "Fs": timeAxis["Fs"]},                
+                        "Channels": listMetadata})
+                    
+                    # Generate the new topics
+                    newTopic = replace_subtopics(next(iter(keysThatFullyMatchInterval)), json_config["Output"]["ModifySubtopics"])
+                    newTopicMetadata = newTopic + "/metadata"
+                    newTopicData = newTopic + "/data"
+
+                    # Release the memory
+                    print(" ====== Cleaning ======= ")
+                    for myKey in myDict:
+                        for chnk in intrvl:
+                            del myDict[myKey]["dataPayloads"][tAxis[chnk]]
+                    intrvl = [0]
+                else:
+                    intrvl.append(intrvl[-1]+1)
+
+        bReadingMyDict = False
+
+        if arrayToDump is not None:
             # Flushing to the destination
             if json_config["Output"]["Destination"] == "file":
                 # ------- Dump to file ---------------
-                # TODO: depending of the destination, chose the right file format
-                # 1. Saving the description as JSON
-                jsonFileDecription = {
-                    "TimeAxis": {
-                        "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
-                        "Nanosec": timeAxis["Nanosec"],
-                        "TimeAtCollectionStart": f'{datetime.utcfromtimestamp(timeAxis["OriginSecFromEpoch"]) + timedelta(microseconds=timeAxis["Nanosec"] / 1000)}',
-                        "Fs": timeAxis["Fs"]},                
-                    "Channels": listMetadata}
-                with open(f'{json_config["Output"]["DestinationFolder"]}/{json_config["Output"]["DestinationFileName"]}_{1000*verCnt+fileCnt}.json', 'w') as json_descr_file:
-                    json.dump(jsonFileDecription, json_descr_file, indent=4)
-                # 2. Saving the data as numpy array in binary form
-                np.save(f'{json_config["Output"]["DestinationFolder"]}/{json_config["Output"]["DestinationFileName"]}_{1000*verCnt+fileCnt}.npy', arrayToDump)
-                fileCnt += 1
-                print("File saved!")
+                print("Dumping to a file is not supported!", file=sys.stderr)
+                sys.exit(1)
             elif json_config["Output"]["Destination"] == "mongodb":
                 # ------- Dump to MongoDB ---------------
-                if not bDatabaseConnectionEstablished:
-                    bDatabaseConnectionEstablished = True
-                    client = MongoClient(json_config["Output"]["DatabaseConnection"])
-                    db = client[json_config["Output"]["DatabaseName"]]
-                    collection = db[json_config["Output"]["DatabaseCollection"]]
-                    # TODO: if the version changed, start saving to the new collection                
-                # insert the data
-                data = {
-                    "TimeAxis": {
-                        "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
-                        "Nanosec": timeAxis["Nanosec"],
-                        "TimeAtCollectionStart_UTC": datetime.utcfromtimestamp(timeAxis["OriginSecFromEpoch"]) + timedelta(microseconds=timeAxis["Nanosec"] / 1000),
-                        "Fs": timeAxis["Fs"]},                
-                    "Channels": listMetadata,
-                    "Data": (arrayToDump.T).tolist()
-                }
-                collection.insert_one(data)
-                print("Collection inserted!")
+                print("Saving to MongoDB is not supported!", file=sys.stderr)
+                sys.exit(1)
             elif json_config["Output"]["Destination"] == "MQTT":
                 # ------- Dump to MQTT ---------------
-                # Metadata
-                jsonMetadata = json.dumps({
-                    "TimeAxis": {
-                        "StartSecFromEpoch": timeAxis["OriginSecFromEpoch"], 
-                        "Nanosec": timeAxis["Nanosec"],
-                        "TimeAtCollectionStart": f'{datetime.utcfromtimestamp(timeAxis["OriginSecFromEpoch"]) + timedelta(microseconds=timeAxis["Nanosec"] / 1000)}',
-                        "Fs": timeAxis["Fs"]},                
-                    "Channels": listMetadata}, indent=4)
-                # Generate the new topic
-                newTopic = replace_subtopics(next(iter(myDict)), json_config["Output"]["ModifySubtopics"])
-                newTopicMetadata = newTopic + "/metadata"
-                newTopicData = newTopic + "/data"
                 # Publish
-                print(f"DEBUG: aray to dump dimensions: {len(arrayToDump.shape)}")
                 print(f"DEBUG: aray to dump dimensions: {arrayToDump.shape[0]} x {arrayToDump.shape[1]}")
                 mqttc.publish(newTopicMetadata, jsonMetadata, qos=json_config["MQTT"]["QoS"])
                 mqttc.publish(newTopicData, arrayToDump.tobytes(), qos=json_config["MQTT"]["QoS"])
@@ -494,9 +383,11 @@ def main():
                 print(f"Error: Unknown destination: {json_config['Output']['Destination']}", file=sys.stderr)
                 sys.exit(1)
 
-        bReadingMyDict = False
+        arrayToDump = None
+        jsonMetadata = None
 
-        time.sleep(0.1)
+
+        time.sleep(3)
         continue
 
 if __name__ == "__main__":
