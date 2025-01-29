@@ -1,6 +1,6 @@
 {
     "Output": {
-        "SamplesToCollect": 24000,
+        "SamplesToCollect": 50000,
         "Destination": "MQTT",
         "Explanation: ModifySubtopics": "Denotes how to modify every element of the topic. Empty = do nothing. Not empty = replace by the given string",
         "ModifySubtopics":

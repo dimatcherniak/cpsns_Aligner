@@ -1,0 +1,104 @@
+{
+    "TimeAxis": {
+        "StartSecFromEpoch": 1737484243,
+        "Nanosec": 378906250,
+        "TimeAtCollectionStart": "2025-01-21 18:30:43.378906",
+        "Fs": 4096.0
+    },
+    "Channels": [
+        {
+            "Descriptor": {
+                "Descriptor length": "uint16",
+                "Metadata version": "uint16",
+                "Seconds since epoch": "uint64",
+                "Nanoseconds": "uint64"
+            },
+            "Data": {
+                "Type": "float",
+                "Samples": 128,
+                "Unit": "m/s^2"
+            },
+            "Sensor": {
+                "Sensing": "acceleration",
+                "Sensitivity": 0.1051364686929521,
+                "Sensitivity unit": "V/(m/s^2)",
+                "Vendor": "HBK",
+                "Type": "4507 B 005",
+                "S/N": "2154414"
+            },
+            "DAQ": {
+                "Type": "3160-A-042_sn_999998",
+                "MAC": "d8-3a-dd-f5-92-48",
+                "IP": ""
+            },
+            "Analysis chain": [
+                {
+                    "Name": "acquisition",
+                    "Output": "raw",
+                    "Sampling": 4096.0
+                },
+                {
+                    "Name": "decimated",
+                    "Output": "lpf",
+                    "Sampling": 256.0
+                }
+            ],
+            "Engineering": {
+                "project": "WTG_A01",
+                "projectid": "2342",
+                "channelgroupname": "MyChannelGroup1",
+                "channelgroupid": 234,
+                "channelName": "ACC-X Top",
+                "columnName": "acc_x_top",
+                "channelId": 45
+            }
+        },
+        {
+            "Descriptor": {
+                "Descriptor length": "uint16",
+                "Metadata version": "uint16",
+                "Seconds since epoch": "uint64",
+                "Nanoseconds": "uint64"
+            },
+            "Data": {
+                "Type": "float",
+                "Samples": 128,
+                "Unit": "m/s^2"
+            },
+            "Sensor": {
+                "Sensing": "acceleration",
+                "Sensitivity": 0.1067571804027622,
+                "Sensitivity unit": "V/(m/s^2)",
+                "Vendor": "HBK",
+                "Type": "4507 B 005",
+                "S/N": "2154484"
+            },
+            "DAQ": {
+                "Type": "3160-A-042_sn_999998",
+                "MAC": "d8-3a-dd-f5-92-48",
+                "IP": ""
+            },
+            "Analysis chain": [
+                {
+                    "Name": "acquisition",
+                    "Output": "raw",
+                    "Sampling": 4096.0
+                },
+                {
+                    "Name": "decimated",
+                    "Output": "lpf",
+                    "Sampling": 256.0
+                }
+            ],
+            "Engineering": {
+                "project": "WTG_A01",
+                "projectid": "2342",
+                "channelgroupname": "MyChannelGroup1",
+                "channelgroupid": 234,
+                "channelName": "ACC-Y Top",
+                "columnName": "acc_y_top",
+                "channelId": 46
+            }
+        }
+    ]
+}
