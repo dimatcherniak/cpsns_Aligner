@@ -1,24 +1,17 @@
 {
     "Output": {
-        "SamplesToCollect": 1024,
+        "SamplesToCollect": 12800,
         "Destination": "MQTT",
         "Explanation: ModifySubtopics": "Denotes how to modify every element of the topic. Empty = do nothing. Not empty = replace by the given string",
         "ModifySubtopics":
-        ["","","","slctd","","algnd"], 
-        "_1Destination": "file",
-        "_DestinationFolder": "MQTTData",
-        "_DestinationFileName": "DAQ_data",
-        "_2Destination": "mongodb",
-        "_DatabaseConnection": "mongodb://localhost:27018/",
-        "_DatabaseName": "mydatabase_RPi_local",
-        "_DatabaseCollection": "mycollection_RPi_local"
+        ["","","","slctd","","algnd"]
     },
     "MQTT": {
         "host": "dtl-server-2.st.lab.au.dk",
         "port": 8090,
         "userId": "dmitri",
         "password": "DmitriHBK-2023",
-        "ClientID": "cpsns_Alligner_RPi_Black",
+        "ClientID": "cpsns_Alligner_LANXi_060",
         "QoS": 1,
         "Comment_1": "the topics must end with '+'!",
         "TopicsToSubscribe": [
