@@ -1,0 +1,12 @@
+*.pyc
+*.log
+.eggs
+build/
+yafem.egg-info/
+.vs/
+.nox/
+**/bin/Debug/
+**/obj/
+**/venv/
+**/venv_nox/
+**/slprj/
